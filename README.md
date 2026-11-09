@@ -107,6 +107,15 @@ fill the app name and support email. Then **Publish app**. Leaving it in *Testin
 kills unattended runs: **refresh tokens expire after 7 days** while an app is in testing status.
 The unverified-app warning screen is expected for personal use — click *Advanced → Go to app*.
 
+To move from *Testing* to *In production* Google requires a **homepage URL and a privacy policy
+URL** on an **authorised domain** (the *Publish app* button stays disabled until they exist).
+`docs/index.html`, `docs/privacy.html` and `docs/terms.html` are ready for GitHub Pages:
+
+1. Push the repo, then *Settings → Pages → Deploy from a branch → `main` / `/docs`*.
+2. Branding: Application home page `https://<user>.github.io/<repo>/`, privacy policy
+   `https://<user>.github.io/<repo>/privacy.html`.
+3. Authorised domains: `<user>.github.io` (bare domain, no scheme or path) → **Save**.
+
 **4. OAuth client** — *Credentials → Create credentials → OAuth client ID →*
 **Desktop app** (not Web application; the helper uses a `127.0.0.1` loopback redirect).
 
