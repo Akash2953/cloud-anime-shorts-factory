@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+tmp_images/
+output_*.mp4
+.env
+verify_frames/
+models/
+build/
+test_*.wav
+test_*.mp4
