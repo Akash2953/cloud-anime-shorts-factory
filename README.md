@@ -96,6 +96,45 @@ Available voices in the bundle: `af_heart` (default), `af_bella`, `af_sky`, `am_
 - Google Cloud project (YouTube API OAuth credentials)
 - FFmpeg installed on renderer runner (provided in GitHub Actions)
 
+## YouTube channel setup (one hour, once)
+
+**1. Google Cloud project** — <https://console.cloud.google.com> → new project (e.g. `shorts-factory`).
+
+**2. Enable the API** — *APIs & Services → Library → YouTube Data API v3 → Enable*.
+
+**3. OAuth consent screen** — User type **External**; add your own Google account as a test user;
+fill the app name and support email. Then **Publish app**. Leaving it in *Testing* is the trap that
+kills unattended runs: **refresh tokens expire after 7 days** while an app is in testing status.
+The unverified-app warning screen is expected for personal use — click *Advanced → Go to app*.
+
+**4. OAuth client** — *Credentials → Create credentials → OAuth client ID →*
+**Desktop app** (not Web application; the helper uses a `127.0.0.1` loopback redirect).
+
+**5. Mint the refresh token** — put the two client values into `.env`, then:
+
+```bash
+python tools/youtube_auth.py
+```
+
+It opens the consent screen, captures the code on loopback, verifies the token against your channel,
+and writes `YOUTUBE_CLIENT_ID` / `YOUTUBE_CLIENT_SECRET` / `YOUTUBE_REFRESH_TOKEN` into `.env`
+without printing the token. Create the channel first at <https://www.youtube.com/create_channel>
+if the script reports none.
+
+**6. Confirm** — `python verify.py --skip-images`, then `python orchestrator.py --render-only`
+for a real 1080×1920 file before spending an upload.
+
+### Quota and the audit trap
+
+- Upload costs **1600 units** of the project's 10,000/day; `videos.update` (privacy flip) ~50.
+  One short per day is nowhere near the limit — 6/day would still fit.
+- **Videos uploaded by a project YouTube hasn't audited can be locked to `private`.** The pipeline
+already uploads `private` first (see `publish.upload_video`) so nothing is published unvetted, but if
+`publish.set_privacy()` fails to make a video public, that is this restriction, not a bug — it needs
+the YouTube API Services audit, or manual publishing from YouTube Studio.
+- Verify once by uploading a single test video, flipping it public, then deleting it before the
+first scheduled run.
+
 ## Secrets required
 
 | Secret | Purpose |
@@ -105,7 +144,9 @@ Available voices in the bundle: `af_heart` (default), `af_bella`, `af_sky`, `am_
 | `YOUTUBE_CLIENT_ID` / `CLIENT_SECRET` / `REFRESH_TOKEN` | YouTube OAuth |
 | `OPENROUTER_API_KEY` | Optional — only used if Cloudflare story generation fails |
 | `KOKORO_VOICE` | Optional — narration voice (default `af_heart`) |
-| `OPENROUTER_API_KEY` | OpenRouter free-tier key |
+
+Local `.env` (gitignored) is read by `config.load_config()`; the same names work as GitHub
+Actions secrets.
 
 ## Run locally
 
