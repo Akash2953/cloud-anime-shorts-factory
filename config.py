@@ -63,6 +63,8 @@ def load_config() -> dict:
         "YOUTUBE_CLIENT_ID": os.environ.get("YOUTUBE_CLIENT_ID", ""),
         "YOUTUBE_CLIENT_SECRET": os.environ.get("YOUTUBE_CLIENT_SECRET", ""),
         "YOUTUBE_REFRESH_TOKEN": os.environ.get("YOUTUBE_REFRESH_TOKEN", ""),
+        # private until you trust the output; set to "public" for hands-off publishing.
+        "PUBLISH_PRIVACY": os.environ.get("PUBLISH_PRIVACY", "private").lower(),
         "OPENROUTER_API_KEY": os.environ.get("OPENROUTER_API_KEY", ""),
         # Optional local gateway (OmniRoute). Not used by the daily pipeline today.
         "OMNIROUTE_API_KEY": os.environ.get("OMNIROUTE_API_KEY", ""),

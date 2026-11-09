@@ -217,7 +217,7 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
             title=title[:100] + " #shorts",
             description="\n\n".join(beats)[:4000],
             access_token=access_token,
-            privacy_status="private",
+            privacy_status=cfg["PUBLISH_PRIVACY"],
         )
         if not video_id:
             logger.error("Upload failed; series queue left untouched for tomorrow.")

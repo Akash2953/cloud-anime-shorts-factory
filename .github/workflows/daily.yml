@@ -54,6 +54,7 @@ jobs:
           KOKORO_VOICE: ${{ vars.KOKORO_VOICE || 'af_heart' }}
           IMAGE_STRATEGY: ${{ vars.IMAGE_STRATEGY || 'edit' }}
           SERIES_PARTS: ${{ vars.SERIES_PARTS || '1' }}
+          PUBLISH_PRIVACY: ${{ vars.PUBLISH_PRIVACY || 'private' }}
           SHOTS_PER_PART: ${{ vars.SHOTS_PER_PART || '0' }}
           PREFERRED_SECONDS: ${{ vars.PREFERRED_SECONDS || '45' }}
           MIN_SECONDS: ${{ vars.MIN_SECONDS || '30' }}
