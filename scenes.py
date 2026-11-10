@@ -18,6 +18,9 @@ every cut. Each shot therefore carries:
     camera         static | pan_left | dolly_in | crane_up | handheld | ...
     character      True when the girl is on screen. Insert and environment shots carry no face,
                    which is what makes identity drift a non-issue for most of the video.
+
+A newer detailed prompt can also produce full image-generation prompts and per-shot audio
+notes; see PLAN_SYSTEM_PROMPT_DETAILED and plan_shots_detailed().
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ import os
 import random
 import re
 from dataclasses import dataclass
+from typing import Optional
 
 import requests
 
@@ -98,6 +102,54 @@ PLAN_SYSTEM_PROMPT = (
     "The shots must tell one continuous story in order, ending on a resolution."
 )
 
+# Detailed prompt — produces per-shot schema + a separate numbered Image Generation Prompts
+# section. Designed to be parsed programmatically.
+PLAN_SYSTEM_PROMPT_DETAILED = (
+    """## Role
+
+You are an expert anime story writer, storyboard artist, and YouTube Shorts editor. You build
+original anime stories and turn them into shot-by-shot schemas and image generation prompts for
+vertical slideshow Shorts optimized for viewer engagement.
+
+## Task
+
+Create an original anime story and break it into one YouTube Short (vertical, 9:16, under 60
+seconds). The Short is a slideshow of anime still images with narration. The slideshow must read
+as a coherent story, not a random image sequence.
+
+**Story requirements:**
+- The story must be complete.
+- Each Short advances the story and resolves or deepens a clear thread.
+- Use as many images as possible while keeping each image clearly relevant.
+
+**Per Shot output format (one entry per shot, in order):**
+
+```
+Shot N:
+- Duration: <seconds>
+- Shot type: <wide|medium|close-up|extreme close-up|...>
+- Camera movement: <static|slow pan|slow zoom|Ken Burns push-in|parallax|...>
+- Visual description: <what appears on screen>
+- Action: <action taking place>
+- Narration: "<voiceover text>"     (or "none" if silent)
+- Audio notes: "<music/SFX/ambient or silence>"
+- Transition: <cut|fade|dissolve>
+- Image prompt ref: Image N
+```
+
+Begin with a count line: "Short 1: N shots, M images."
+
+**After all shots, add this section header exactly:**
+```
+--- IMAGE GENERATION PROMPTS ---
+```
+Then list every image prompt, one per line, numbered sequentially (Image 1:, Image 2:, …). Each
+prompt must be fully self-contained and include: art style, consistent character description,
+setting/time/lighting/mood, composition (portrait 9:16), emotional beat, and an engagement hook.
+
+Keep each field concise and concrete so the output can be extracted programmatically."""
+)
+
 
 @dataclass
 class Shot:
@@ -110,6 +162,14 @@ class Shot:
     camera: str = "static"
     character: bool = False
     seconds: float = 3.0
+    # Detailed-mode extras:
+    shot_type: str = ""
+    camera_movement: str = ""
+    visual_description: str = ""
+    audio_notes: str = ""
+    transition: str = ""
+    image_prompt_ref: int = 0
+    image_generation_prompt: str = ""
 
     def prompt(self) -> str:
         """Scene and action lead; the character signature is short and comes last."""
@@ -127,6 +187,8 @@ class Shot:
             "action": self.action, "story_object": self.story_object,
             "narrative_role": self.narrative_role, "camera": self.camera,
             "character": self.character, "seconds": self.seconds,
+            "image_generation_prompt": self.image_generation_prompt,
+            "audio_notes": self.audio_notes,
         }
 
     @classmethod
@@ -138,6 +200,8 @@ class Shot:
             narrative_role=d.get("narrative_role", "build_tension"),
             camera=d.get("camera", "static"), character=bool(d.get("character", False)),
             seconds=float(d.get("seconds", 3.0)),
+            image_generation_prompt=d.get("image_generation_prompt", ""),
+            audio_notes=d.get("audio_notes", ""),
         )
 
 
@@ -291,6 +355,177 @@ def plan_arc(*, theme: str, parts: int, per_part: int,
     return [shots], fallback
 
 
+def parse_detailed_response(text: str) -> tuple[list[Shot], dict[int, str]]:
+    """Parse the structured detailed-format output into Shots + image prompts.
+
+    Returns (shots, image_prompts) where image_prompts maps image_number -> prompt_text.
+    Falls back gracefully when the LLM output doesn't match the expected structure.
+    """
+    shots: list[Shot] = []
+    image_prompts: dict[int, str] = {}
+
+    if not text:
+        return shots, image_prompts
+
+    # Split into shot entries and image-prompt section
+    img_section_match = re.search(r"---\s*IMAGE GENERATION PROMPTS\s*---", text, re.IGNORECASE)
+    if img_section_match:
+        shot_text = text[:img_section_match.start()]
+        img_text = text[img_section_match.end():]
+    else:
+        shot_text = text
+        img_text = ""
+
+    # Parse individual shot blocks
+    shot_blocks = re.split(r"(?=^Shot\s+\d+\s*:)", shot_text, flags=re.MULTILINE)
+    for block in shot_blocks:
+        block = block.strip()
+        if not block or not re.match(r"Shot\s+\d+", block, re.IGNORECASE):
+            continue
+
+        duration = 3.0
+        shot_type = "medium"
+        camera_movement = "static"
+        visual_desc = ""
+        action = ""
+        narration = ""
+        audio_notes = ""
+        transition = "cut"
+        img_ref = 0
+
+        for line in block.splitlines():
+            line = line.strip()
+            lower = line.lower()
+            if lower.startswith("- duration:"):
+                try:
+                    duration = float(re.search(r"([\d.]+)", line).group(1))
+                except Exception:
+                    pass
+            elif lower.startswith("- shot type:"):
+                st = line.split(":", 1)[1].strip()
+                shot_type = _map_shot_type(st)
+            elif lower.startswith("- camera movement:"):
+                camera_movement = line.split(":", 1)[1].strip()
+            elif lower.startswith("- visual description:"):
+                visual_desc = line.split(":", 1)[1].strip()
+            elif lower.startswith("- action:"):
+                action = line.split(":", 1)[1].strip()
+            elif lower.startswith("- narration:"):
+                narration = line.split(":", 1)[1].strip().strip('"')
+            elif lower.startswith("- audio notes:"):
+                audio_notes = line.split(":", 1)[1].strip().strip('"')
+            elif lower.startswith("- transition:"):
+                transition = line.split(":", 1)[1].strip()
+            elif lower.startswith("- image prompt ref:"):
+                m = re.search(r"(\d+)", line)
+                if m:
+                    img_ref = int(m.group(1))
+
+        # Skip shots without narration (unless explicitly "none")
+        if not narration and img_ref == 0:
+            continue
+
+        shot = Shot(
+            narration=narration or "none",
+            shot_size=shot_type,
+            place=visual_desc[:60] if visual_desc else "a rainy city street",
+            action=action or "she watches",
+            story_object="paper lantern" if img_ref else "no object",
+            narrative_role=_infer_role(img_ref),
+            camera=camera_movement.replace(" ", "_"),
+            seconds=duration,
+            visual_description=visual_desc,
+            audio_notes=audio_notes,
+            transition=transition,
+            image_prompt_ref=img_ref,
+        )
+        shots.append(shot)
+
+    # Parse image generation prompts section
+    for m in re.finditer(r"Image\s+(\d+)\s*:\s*(.+?)(?=\nImage\s+\d+\s*:|$)", img_text,
+                         re.IGNORECASE | re.DOTALL):
+        num = int(m.group(1))
+        prompt = " ".join(m.group(2).split())  # collapse whitespace
+        image_prompts[num] = prompt
+
+    return shots, image_prompts
+
+
+def _infer_role(img_ref: int) -> str:
+    """Return a narrative role based on the image number."""
+    roles = ["establish_context", "introduce_subject", "build_tension", "deliver_payload",
+             "emotional_beat", "evidence", "resolution", "call_to_action"]
+    return roles[min(img_ref - 1, len(roles) - 1)]
+
+
+def _map_shot_type(raw: str) -> str:
+    """Map freeform shot-type strings to known shot_size keys."""
+    low = raw.lower()
+    mapping = {
+        "extreme close-up": "insert", "close-up": "close_up",
+        "medium close": "medium_close", "medium": "medium",
+        "medium wide": "medium_wide", "wide": "wide",
+        "establishing": "establishing", "over the shoulder": "over_shoulder",
+    }
+    for key, val in mapping.items():
+        if key in low:
+            return val
+    return "medium"
+
+
+def compose_image_prompts(shots: list[Shot], image_prompts: dict[int, str]) -> list[str]:
+    """Build per-shot image prompts, falling back to the standard prompt builder."""
+    results = []
+    for s in shots:
+        if s.image_generation_prompt:
+            results.append(s.image_generation_prompt)
+        elif s.image_prompt_ref and s.image_prompt_ref in image_prompts:
+            results.append(image_prompts[s.image_prompt_ref])
+        else:
+            results.append(s.prompt())
+    return results
+
+
+def plan_shorts_detailed(
+    *,
+    theme: str,
+    cfa_token: str = "",
+    account_id: str = "",
+    api_key: str = "",
+) -> tuple[list[Shot], dict[int, str], bool]:
+    """Run the detailed prompt and parse its structured output.
+
+    Returns (shots, image_prompts, used_fallback).
+    """
+    messages = [
+        {"role": "system", "content": PLAN_SYSTEM_PROMPT_DETAILED},
+        {"role": "user", "content": f"Theme/story idea: {theme}"},
+    ]
+
+    text = _workers_ai(messages, cfa_token, account_id)
+    if not text:
+        text = _openrouter(messages, api_key)
+
+    if not text:
+        logger.warning("Detailed planner unavailable; falling back to basic plan_shots")
+        return [], {}, True
+
+    shots, image_prompts = parse_detailed_response(text)
+
+    if not shots:
+        logger.warning("Detailed planner returned 0 shots; falling back")
+        return [], {}, True
+
+    # If some shots lack their image prompt but refs exist, fill them in
+    for s in shots:
+        if s.image_prompt_ref and s.image_prompt_ref in image_prompts:
+            s.image_generation_prompt = image_prompts[s.image_prompt_ref]
+
+    logger.info("Detailed scene plan: %d shots, %d unique image prompts",
+                len(shots), len(image_prompts))
+    return shots, image_prompts, False
+
+
 def _workers_ai(messages, cfa_token: str, account_id: str) -> str | None:
     if not (cfa_token and account_id):
         return None
@@ -299,8 +534,8 @@ def _workers_ai(messages, cfa_token: str, account_id: str) -> str | None:
             r = requests.post(
                 f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}",
                 headers={"Authorization": f"Bearer {cfa_token}", "Content-Type": "application/json"},
-                json={"messages": messages, "max_tokens": 1200, "temperature": 0.8},
-                timeout=90)
+                json={"messages": messages, "max_tokens": 2000, "temperature": 0.8},
+                timeout=120)
         except requests.RequestException as exc:
             logger.warning("Workers AI planner request failed: %s", exc)
             continue
@@ -324,9 +559,9 @@ def _openrouter(messages, api_key: str) -> str | None:
             r = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": model, "messages": messages, "max_tokens": 1200,
+                json={"model": model, "messages": messages, "max_tokens": 2000,
                       "temperature": 0.8},
-                timeout=90)
+                timeout=120)
         except requests.RequestException as exc:
             logger.warning("OpenRouter planner %s failed: %s", model, exc)
             continue
