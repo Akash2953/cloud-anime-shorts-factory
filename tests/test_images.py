@@ -134,5 +134,39 @@ class TestCropGrid(unittest.TestCase):
             self.assertEqual(probe, "300,300")
 
 
+class TestLoadFrames(unittest.TestCase):
+    """`--reuse-frames` must hand the beats back in shot order."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write(self, name: str, payload: bytes = JPEG) -> None:
+        (self.dir / name).write_bytes(payload)
+
+    def test_double_digits_sort_numerically(self):
+        for i in (0, 1, 2, 10, 11, 12):
+            self.write(f"frame_{i}.jpg")
+        self.assertEqual([p.name for p in images.load_frames(self.dir)],
+                         ["frame_0.jpg", "frame_1.jpg", "frame_2.jpg", "frame_10.jpg",
+                          "frame_11.jpg", "frame_12.jpg"])
+
+    def test_one_file_per_beat_and_jpg_wins(self):
+        self.write("frame_0.jpg")
+        self.write("frame_0.png", b"\x89PNG")
+        self.write("frame_1.png", b"\x89PNG")
+        loaded = images.load_frames(self.dir)
+        self.assertEqual([p.name for p in loaded], ["frame_0.jpg", "frame_1.png"])
+
+    def test_sheet_panels_are_not_beats(self):
+        self.write("frame_0.jpg")
+        self.write("panel_0.jpg")
+        self.write("panel_1.jpg")
+        self.assertEqual(len(images.load_frames(self.dir)), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

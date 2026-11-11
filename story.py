@@ -44,7 +44,7 @@ BEAT_SYSTEM_PROMPT = (
     "draw, and avoid meta commentary, headers, quotes, or emoji."
 )
 
-MAX_PARTS = 4
+MAX_PARTS = 7
 
 # Reasoning-style free models leak their chain of thought into the reply. These markers
 # identify narration lines that are really meta text and must never reach the voice track.

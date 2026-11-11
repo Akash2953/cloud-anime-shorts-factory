@@ -1,6 +1,7 @@
 """FFmpeg video rendering for vertical 9:16 shorts."""
 
 import logging
+import math
 import subprocess
 from pathlib import Path
 
@@ -45,15 +46,20 @@ def _fit_chain(width: int, height: int, fit: str) -> str:
     raise ValueError(f"unknown fit mode: {fit}")
 
 
-def _ken_burns(index: int, frames: int, zoom_max: float = 1.12) -> str:
-    """Slow push-in on even beats, pull-out on odd ones, always centred."""
+def _ken_burns(index: int, frames: int, fps: int, zoom_max: float = 1.12) -> str:
+    """Slow push-in on even beats, pull-out on odd ones, always centred.
+
+    `fps` must be the render's frame rate: zoompan's own default is 30, and emitting 30 fps
+    frames that are then trimmed to a duration computed at 24 fps makes every beat 1.25x short,
+    which desyncs the whole short from its voice track.
+    """
     step = (zoom_max - 1.0) / max(frames, 1)
     centred = "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
     if index % 2 == 0:
         z = f"min(zoom+{step:.6f},{zoom_max})"
     else:
         z = f"if(lte(on,1),{zoom_max},max(zoom-{step:.6f},1.0))"
-    return f"zoompan=z='{z}':{centred}:d={frames}:s=1080x1920:fps=30"
+    return f"zoompan=z='{z}':{centred}:d={frames}:s=1080x1920:fps={fps}"
 
 
 def render_narration(
@@ -85,10 +91,13 @@ def render_narration(
 
     graph: list[str] = []
     for i, duration in enumerate(durations):
-        frames = max(int(round(duration * fps)), 1)
+        # ceil, not round: the trimmed beat can never be longer than the frames Ken Burns actually
+        # generated, and 13 beats of half-frame shortfall ended the video 1 frame before the audio
+        # (44.833s picture vs 44.885s sound) so the last word lost its tail.
+        frames = max(int(math.ceil(duration * fps)), 1)
         chain = [_fit_chain(width, height, fit)]
         if ken_burns:
-            chain.append(_ken_burns(i, frames))
+            chain.append(_ken_burns(i, frames, fps))
         chain.append(f"trim=duration={duration:.3f}")
         chain.append("setpts=PTS-STARTPTS")
         chain.append("format=yuv420p")
@@ -96,7 +105,11 @@ def render_narration(
 
     concat_inputs = "".join(f"[v{i}]" for i in range(len(durations)))
     audio_index = len(image_paths)
-    graph.append(f"{concat_inputs}concat=n={len(durations)}:v=1:a=0[vout]")
+    # `-t` can only trim, never extend: per-beat frame quantisation left the concatenated picture
+    # a frame or two short, so the tail of the last word was cut off. Hold the final frame long
+    # enough for the clamp to do the cutting instead.
+    graph.append(f"{concat_inputs}concat=n={len(durations)}:v=1:a=0[vcat]")
+    graph.append("[vcat]tpad=stop_mode=clone:stop_duration=1[vout]")
     # Normalise to -14 LUFS / -1.5 dBTP so every short arrives at YouTube at the same level.
     graph.append(f"[{audio_index}:a]apad,asetpts=PTS-STARTPTS,loudnorm=I=-14:TP=-1.5:LRA=11[aout]")
 

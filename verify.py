@@ -17,7 +17,7 @@ from pathlib import Path
 
 from audio import SAMPLE_RATE, Narration, join_with_gaps, write_wav
 from config import load_config
-from images import KLEIN, SCHNELL, image_ext, produce_images
+from images import KLEIN, SCHNELL, image_ext, load_frames, produce_images
 from render import render_narration
 from scenes import Shot, plan_shots, shots_for_duration
 
@@ -80,7 +80,6 @@ def main() -> int:
         theme="cyberpunk anime, floating paper lanterns over a rain-soaked city, "
               "a hooded girl searching for her missing brother",
         count=count,
-        cfa_token=cfg["CFAI_TOKEN"], account_id=cfg["CF_ACCOUNT_ID"],
         api_key=cfg["OPENROUTER_API_KEY"])
     roles = {s.narrative_role for s in shots}
     no_char = sum(1 for s in shots if not s.character)
@@ -94,7 +93,7 @@ def main() -> int:
     # 2. Images ---------------------------------------------------------------
     frames: list[Path] = []
     if args.skip_images and FRAMES.exists() and any(FRAMES.glob("frame_*.*")):
-        frames = sorted(FRAMES.glob("frame_*.*"))
+        frames = load_frames(FRAMES)
         record("images", len(frames) >= 8, f"reused {len(frames)} cached frames (no quota)")
     else:
         FRAMES.mkdir(parents=True, exist_ok=True)

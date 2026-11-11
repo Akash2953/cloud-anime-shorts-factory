@@ -1,0 +1,51 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//d/project_cloud_Anime_shorts_factory/**)",
+      "Bash(python orchestrator.py --render-only)",
+      "Bash(python -c \"import json; d=json.load\\(open\\('state.json'\\)\\); print\\(json.dumps\\(d['daily'], indent=2\\)\\)\")",
+      "Bash(python orchestrator.py)",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"from scenes import plan_shorts_detailed, Shot; print\\('OK'\\)\")",
+      "Bash(python -c \"from orchestrator import run_pipeline; print\\('orchestrator OK'\\)\")",
+      "Bash(python -m py_compile scenes.py orchestrator.py)",
+      "Bash(python -c \"from config import load_config; c = load_config\\(\\); print\\('Keys:', list\\(c.keys\\(\\)\\)\\)\")",
+      "Bash(python -c \"from config import load_config; c = load_config\\(\\); print\\('MIN_SECONDS', c.get\\('MIN_SECONDS'\\), 'MAX_SECONDS', c.get\\('MAX_SECONDS'\\), 'PREFERRED_SECONDS', c.get\\('PREFERRED_SECONDS'\\)\\)\")",
+      "Bash(python -c \"from config import Limits; l = Limits\\(\\); print\\('max_daily_uploads:', l.max_daily_uploads, 'max_image_attempts_per_day:', l.max_image_attempts_per_day\\)\")",
+      "Bash(python -c \"from audio import Narration; n = Narration\\(\\); print\\(dir\\(n\\)\\)\")",
+      "Bash(python -c \"import json; d=json.load\\(open\\('state.json'\\)\\); print\\(d.get\\('daily', {}\\).get\\('2026-11-10', {}\\)\\)\")",
+      "Bash(grep -n \"unicode\\\\|\\\\\\\\u2192\\\\|->\\\\|→\" orchestrator.py audio.py)",
+      "Bash(python -c \"import json; d=json.load\\(open\\('state.json'\\)\\); print\\(d['daily']\\)\")",
+      "Bash(ffprobe -v error -select_streams v:0 -show_entries stream=width,height,duration,r_frame_rate -of default=noprint_wrappers=1 output_short.mp4)",
+      "Bash(git add *)",
+      "Bash(git commit -m 'Add detailed shot planner with image/audio prompt extraction *)",
+      "Bash(ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 output_short.mp4)",
+      "Bash(git config *)",
+      "Bash(python -c \"import os; print\\({k: bool\\(os.environ.get\\(k\\)\\) for k in ['CFAI_TOKEN','CF_ACCOUNT_ID','OPENROUTER_API_KEY']}\\)\")",
+      "Bash(python -c \"from scenes import plan_shots, shots_for_duration; from config import load_config; cfg = load_config\\(\\); shots, fallback = plan_shots\\(theme='cyberpunk anime, floating paper lanterns over a rain-soaked city, a hooded girl searching for her missing brother', count=shots_for_duration\\(cfg['PREFERRED_SECONDS']\\), cfa_token='', account_id='', api_key=''\\); print\\(f'Generated {len\\(shots\\)} shots \\(fallback={fallback}\\)'\\); [print\\(f'{i+1}. [{s.shot_size:<12} {s.narrative_role:<18}] {s.narration}'\\) for i, s in enumerate\\(shots\\)]\")",
+      "Read(//data/user/code/**)",
+      "Read(//d/data/user/code/**)",
+      "Bash(find /data/user/code -name \"scenes.py\" -type f 2>/dev/null)",
+      "Read(//data/user/**)",
+      "Read(//tmp/**)",
+      "Read(//d/tmp/**)",
+      "PowerShell(python -c \"from orchestrator import run_pipeline; run_pipeline\\(story_prompt=None\\)\")",
+      "Bash(python -c \"from orchestrator import run_pipeline; run_pipeline\\(\\)\")",
+      "Bash(xargs grep -l \"if __name__ ==\")",
+      "Bash(python3 -)",
+      "Bash(python tools/youtube_auth.py)",
+      "Bash(ls -la \"D:\\\\\\\\project\\\\\\\\cloud-anime-shorts-factory\")",
+      "Bash(ffprobe -v error -show_entries format=duration,size:stream=codec_name,codec_type,width,height -of default=noprint_wrappers=1 build/output_part1.mp4)",
+      "Bash(python orchestrator.py --help)",
+      "PowerShell(python upload_specific.py)",
+      "PowerShell($env:PUBLISH_PRIVACY = \"public\"; python upload_parts23.py)",
+      "Bash(python upload_parts23.py)",
+      "Bash(git commit *)",
+      "Bash(git rebase *)",
+      "PowerShell(git add .)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\akash\\.claude\\projects\\d--project-cloud-anime-shorts-factory\\tests"
+    ]
+  }
+}

@@ -53,12 +53,15 @@ jobs:
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
           KOKORO_VOICE: ${{ vars.KOKORO_VOICE || 'af_heart' }}
           IMAGE_STRATEGY: ${{ vars.IMAGE_STRATEGY || 'edit' }}
+          # 'auto' = the planner chooses each story's arc length (PARTS_MIN..PARTS_MAX)
           SERIES_PARTS: ${{ vars.SERIES_PARTS || '1' }}
+          PARTS_MIN: ${{ vars.PARTS_MIN || '1' }}
+          PARTS_MAX: ${{ vars.PARTS_MAX || '7' }}
           PUBLISH_PRIVACY: ${{ vars.PUBLISH_PRIVACY || 'private' }}
           SHOTS_PER_PART: ${{ vars.SHOTS_PER_PART || '0' }}
-          PREFERRED_SECONDS: ${{ vars.PREFERRED_SECONDS || '45' }}
-          MIN_SECONDS: ${{ vars.MIN_SECONDS || '30' }}
-          MAX_SECONDS: ${{ vars.MAX_SECONDS || '68' }}
+          PREFERRED_SECONDS: ${{ vars.PREFERRED_SECONDS || '55' }}
+          MIN_SECONDS: ${{ vars.MIN_SECONDS || '45' }}
+          MAX_SECONDS: ${{ vars.MAX_SECONDS || '75' }}
         run: |
           python orchestrator.py
 

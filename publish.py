@@ -32,6 +32,7 @@ def upload_video(
     access_token: str,
     *,
     privacy_status: str = "private",
+    tags: list[str] | None = None,
 ) -> str | None:
     """Upload MP4 bytes to YouTube Shorts as private (default) to allow manual validation."""
     init_url = "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status"
@@ -46,7 +47,7 @@ def upload_video(
             "title": title[:100],
             "description": description[:5000],
             "categoryId": "24",  # Entertainment
-            "tags": ["anime", "shorts", "animation"],
+            "tags": tags or ["anime", "shorts", "animation"],
         },
         "status": {
             "privacyStatus": privacy_status,

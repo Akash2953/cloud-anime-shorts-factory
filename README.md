@@ -7,9 +7,9 @@ Zero-cost cloud pipeline that autonomously generates and publishes one anime-sty
 ```
 GitHub Actions (cron 12:00 UTC) — one upload per day
     └── Python Orchestrator
-         ├── Scene plan     Cloudflare llama-3.3-70b → OpenRouter → local template
+         ├── Scene plan     OpenRouter free models → local template (never Workers AI)
          │                  shot list: size/camera/place/action/object/role/character/narration
-         │                  1 part per short, or up to 4 parts queued across days
+         │                  1 part per short, or up to 7 parts queued across days
          ├── Images         strategy `edit`: first character shot = canon, later character
          │                  shots = edits of it; env/insert shots render fresh
          │                  fallbacks: `sheet` (one sheet, cropped) → `fresh` (unlocked)
@@ -32,10 +32,13 @@ No object storage: the rendered MP4 goes straight to YouTube in the same run.
 `place` / `action` / `story_object` | concrete and physical — a painter can draw them
 `character` | false for inserts and establishing shots, so most cuts never need a face
 
-45 s → **13 shots ≈ 3.3 s per cut**, inside the 1–3 s short-form change rate, with ≥ 6 shots that
-have no character on screen. Prompts put **scene first** and the character signature last — a
-leading character paragraph collapses every frame into the same portrait (measured: 7 medium
-portraits vs. 13 varied shots).
+55 s → **8 shots ≈ 6.8 s per cut** (`SECONDS_PER_CUT`, clamped to 6–10 shots). Fewer, longer cuts
+exist so the voice-over can carry two or three connected sentences per shot: at a 3.4 s rhythm
+each beat only fits ~8 words, and thirteen 8-word lines render as thirteen captions rather than a
+story. Narration is budgeted from the narrator's measured rate (158 wpm → ~145 words for 55 s) and
+a plan whose lines average under 11 words triggers exactly one repair request. Prompts put
+**scene first** and the character signature last — a leading character paragraph collapses every
+frame into the same portrait (measured: 7 medium portraits vs. 13 varied shots).
 
 ### Character consistency (why the pictures hold together)
 
@@ -55,27 +58,60 @@ portraits vs. 13 varied shots).
 ### Runtime is emergent, not fixed
 
 Narration is synthesised at **natural pace** (speed 1.0). Speed is only adjusted when the total
-falls outside `MIN_SECONDS`–`MAX_SECONDS` (default 30–68 s), so a 6-beat script typically lands
-~33–45 s without the drawl of a forced 45 s. Tune with `MIN_SECONDS` / `MAX_SECONDS`.
+falls outside `MIN_SECONDS`–`MAX_SECONDS` (default 45–75 s), so an 8-beat story typically lands
+~50–60 s without the drawl of a forced 55 s. Tune with `MIN_SECONDS` / `MAX_SECONDS`.
 
 ### Multi-part stories
 
-A story that does not fit one short can span up to **4 parts** (`SERIES_PARTS=1..4`). The arc is
-generated once, stored in `state.json`, and each daily run uploads the next part; the queue only
-advances after a **successful upload**, so a failed day retries the same part. Parts are titled
-`… — Part n/N`. A local-template fallback story is never persisted, so a degraded day cannot
+A story that does not fit one short can span up to **7 parts**. Set `SERIES_PARTS` to an int
+(`1..7`) for a fixed length, or to **`auto`** and let the planner decide per story: on a new
+story it states `Arc: N parts` in the same reply that plans part 1, N is clamped to
+`PARTS_MIN..PARTS_MAX` (default `1..7`), and the length is then **pinned** in `state.json` so a
+later `SERIES_PARTS` change cannot split an arc that is already half-published. A tight idea
+comes back as 1 part, a hunt-descent-reunion as 3, a saga as 5–7 — one request, no extra call.
+
+The arc is generated one part per day, appended to `state.json`, and each daily run uploads the
+next part; the queue only advances after a **successful upload**, so a failed day retries the same
+part. Parts are titled `… — Part n/N`. When the last part is uploaded the next run starts a new
+story (and, under `auto`, picks a new length).
+
+Each part is planned knowing its position: parts `1..N-1` are told *not* to resolve and must end
+on a hook (`build_tension` / `deliver_payload`), only part `N` may close on a `resolution`. The
+planner also receives the narration already told (*story so far*) so a later part continues the
+same story instead of inventing a new one. `validate_story_position()` logs a warning whenever a
+plan contradicts its position — a middle part that resolves, or a final part that does not — which
+is how an open-ended short used to reach the upload step unnoticed. Image prompts are stored on
+each shot (`image_generation_prompt`) rather than in a part-indexed dict, so part 2 cannot pick up
+part 1's prompt. A local-template fallback story is never persisted, so a degraded day cannot
 lock placeholder text into the series.
 
 ### Zero-spend policy
 - No provider assumed to offer a permanent free quota.
 - Router rejects providers that require payment.
-- Stops on free-limit exhaustion (fail-closed): `429` from Workers AI aborts image generation
-  immediately instead of retrying, and the run exits without uploading or advancing the queue.
-- Max 8 image attempts per day, max 1 upload per day (`MAX_IMAGE_ATTEMPTS` overrides for dev only).
+- Story planning never touches Workers AI: its daily neurons belong to image generation, so
+  planning goes OpenRouter → local template (`plan_shots`/`plan_arc`/`plan_shorts_detailed`
+  accept no Cloudflare credentials at all).
+- Stops on free-limit exhaustion (fail-closed): `4006` / `429` from Workers AI aborts image
+  generation immediately instead of retrying, and the run exits without uploading or advancing
+  the queue. The error code is logged, so "quota spent" is never mistaken for "rate limited".
+- Max 16 image attempts per day (one per beat for a 13-shot short, plus headroom for retries),
+  max 1 upload per day (`MAX_IMAGE_ATTEMPTS` overrides for dev only).
 
-> Free Workers AI is **10,000 neurons/day per account**. `flux-2-klein` edits bill more per image
-> than `flux-1-schnell`, so a 6-beat `edit` run is the practical ceiling per day. That is exactly
-> the signal to switch `IMAGE_STRATEGY=sheet` (one render, six crops).
+**What 10,000 neurons actually buys** (rates from
+<https://developers.cloudflare.com/workers-ai/platform/pricing/>, `$0.011 / 1,000 neurons`,
+reset at 00:00 UTC). Images are 1024×1024, i.e. 4 tiles of 512×512:
+
+| call | billing | neurons | per 10k/day |
+|---|---|---|---|
+| `flux-1-schnell` fresh | 4 tiles × 4.80 + 4 steps × 9.60 | **~58** | **~170 images** |
+| `flux-2-klein-4b` edit | 4 input × 5.37 + 4 output × 26.05 | **~126** | **~80 edits** |
+| `sheet` (one render, N crops) | one schnell image | ~58 | ~170 sheets |
+
+So a 13-shot short costs **~750 neurons** (`fresh`, 13 images) or **~1,450 neurons** (`edit`:
+1 canonical + 10 edits + 2 environment renders) — about **7–13 shorts per day** inside the free
+allowance. The real ceilings are one upload/day and OpenRouter's 50 free planner requests/day
+(1–2 per short), not the neuron budget. Keep `IMAGE_STRATEGY=sheet` for the case that *is* tight:
+the planner's free models are down, or a run has to be re-rendered several times in one day.
 
 ### Local models
 
@@ -151,7 +187,7 @@ first scheduled run.
 | `CFAI_TOKEN` | Cloudflare AI API token |
 | `CF_ACCOUNT_ID` | Cloudflare account ID (for Workers AI; falls back to `R2_ACCOUNT_ID`) |
 | `YOUTUBE_CLIENT_ID` / `CLIENT_SECRET` / `REFRESH_TOKEN` | YouTube OAuth |
-| `OPENROUTER_API_KEY` | Optional — only used if Cloudflare story generation fails |
+| `OPENROUTER_API_KEY` | Story planning — the only text provider used |
 | `KOKORO_VOICE` | Optional — narration voice (default `af_heart`) |
 
 Local `.env` (gitignored) is read by `config.load_config()`; the same names work as GitHub
@@ -172,15 +208,18 @@ Useful flags: `--offline-images` (test-pattern frames, no quota), `--reuse-frame
 (re-render `build/frames/`, no quota), `--no-audio` (silent cut for debugging),
 `--strategy edit|sheet|fresh` (pin the image strategy for one run).
 
-Environment knobs: `IMAGE_STRATEGY`, `MIN_SECONDS`, `MAX_SECONDS`, `SERIES_PARTS`,
-`SHOTS_PER_PART`, `PREFERRED_SECONDS`, `KOKORO_VOICE`, `MAX_IMAGE_ATTEMPTS`, `OPENROUTER_MODELS`.
+Environment knobs: `IMAGE_STRATEGY`, `MIN_SECONDS`, `MAX_SECONDS`, `SERIES_PARTS` (`1..7` or
+`auto`), `PARTS_MIN`, `PARTS_MAX`, `SHOTS_PER_PART`, `PREFERRED_SECONDS`, `KOKORO_VOICE`,
+`MAX_IMAGE_ATTEMPTS`, `OPENROUTER_MODELS`.
 
-> **Story fallback ordering.** Cloudflare `llama-3.3-70b-fast` → OpenRouter → local template.
-> `openrouter/free` is an auto-router that can land on a *reasoning* model which burns the whole
-> token budget thinking and returns `content: null`, so the OpenRouter step walks a model list
-> (`OPENROUTER_MODELS`, comma separated) and skips empty or rate-limited replies. Upstream free
-> models are frequently `429`; when every provider fails the run uses template narration — and
-> because a template story is never persisted, the next day retries the real providers.
+> **Story fallback ordering.** OpenRouter (`OPENROUTER_MODELS`, comma separated; defaults walk
+> nemotron-3-ultra → north-mini-code → gemma-4-26b → `openrouter/free`) → local template.
+> Free reasoning models can spend the entire completion budget thinking and return `content: null`
+> (measured: `reasoning_tokens: 2169` of 1999, content empty), so planning runs with
+> `max_tokens=4096` and logs `finish_reason` / `reasoning_tokens` on every reply; a truncated
+> storyboard (`finish_reason=length`) is named in the log instead of quietly coming back short.
+> Upstream free models are also frequently `429`. When every model fails the run uses template
+> narration — and because a template story is never persisted, the next day retries real ones.
 
 ## Verify against the live providers
 

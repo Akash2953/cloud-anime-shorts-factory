@@ -27,7 +27,9 @@ class Limits:
     """Hard limits enforcing the zero-spend, one-short-per-day policy."""
 
     max_images_per_short: int = 6
-    max_image_attempts_per_day: int = 8
+    # One image per beat: shots_for_duration() caps at 16, so this never forces beats to share a
+    # frame, with headroom for a few retries inside the daily neuron allowance.
+    max_image_attempts_per_day: int = 16
     max_daily_uploads: int = 1
     openrouter_free_daily_limit: int = 50
     openrouter_free_minute_limit: int = 20
@@ -53,6 +55,26 @@ class Defaults:
     )
 
 
+def _parts_bound(raw: str | None, default: int) -> int:
+    try:
+        return max(1, min(int(raw or default), MAX_PARTS))
+    except ValueError:
+        return default
+
+
+def _series_parts(raw: str | None) -> int | str:
+    """`SERIES_PARTS` is either a fixed count or "auto" (the planner picks the arc length)."""
+    value = (raw or "").strip().lower()
+    if value in ("auto", "0"):
+        return "auto"
+    if not value:
+        return 1
+    try:
+        return max(1, min(int(value), MAX_PARTS))
+    except ValueError:
+        return 1
+
+
 def load_config() -> dict:
     load_dotenv()
     return {
@@ -76,16 +98,22 @@ def load_config() -> dict:
         "GITHUB_PAT": os.environ.get("GITHUB_PAT", ""),
         "FFMPEG_AVAILABLE": True,
         "KOKORO_VOICE": os.environ.get("KOKORO_VOICE", "af_heart"),
-        # Daily image ceiling. Raise for interactive development; the unattended run keeps 8.
-        "MAX_IMAGE_ATTEMPTS": os.environ.get("MAX_IMAGE_ATTEMPTS") or 8,
+        # Daily image ceiling. 16 = one image per beat for the longest short (13-16 shots), so
+        # reuse only kicks in above that. Raise for interactive development.
+        "MAX_IMAGE_ATTEMPTS": os.environ.get("MAX_IMAGE_ATTEMPTS") or 16,
         # Image strategy: edit (canonical + conditioned edits) | sheet (one sheet, cropped) | fresh
         "IMAGE_STRATEGY": os.environ.get("IMAGE_STRATEGY", "edit"),
         # Runtime is emergent, not fixed: speech is only re-timed to land inside this window.
-        "MIN_SECONDS": float(os.environ.get("MIN_SECONDS", 30)),
-        "MAX_SECONDS": float(os.environ.get("MAX_SECONDS", 68)),
-        # A story may span up to MAX_PARTS shorts, one uploaded per day.
-        "SERIES_PARTS": max(1, min(int(os.environ.get("SERIES_PARTS") or 1), MAX_PARTS)),
-        # Shots per part. 0 = derive from PREFERRED_SECONDS (~3.4s per cut).
+        # Narration is read aloud at ~158 wpm: a 55s short carries ~145 words of story. Too short
+        # a window forces the narrator to speed up, which is what made the earlier shorts clip.
+        "MIN_SECONDS": float(os.environ.get("MIN_SECONDS", 45)),
+        "MAX_SECONDS": float(os.environ.get("MAX_SECONDS", 75)),
+        # How many shorts a story spans, one uploaded per day: an int, or "auto" to let the
+        # planner choose the arc length per story (stated once, then pinned in state.json).
+        "SERIES_PARTS": _series_parts(os.environ.get("SERIES_PARTS")),
+        "PARTS_MIN": _parts_bound(os.environ.get("PARTS_MIN"), 1),
+        "PARTS_MAX": _parts_bound(os.environ.get("PARTS_MAX"), MAX_PARTS),
+        # Shots per part. 0 = derive from PREFERRED_SECONDS (~6.8s per cut).
         "SHOTS_PER_PART": int(os.environ.get("SHOTS_PER_PART") or 0),
-        "PREFERRED_SECONDS": float(os.environ.get("PREFERRED_SECONDS") or 45),
+        "PREFERRED_SECONDS": float(os.environ.get("PREFERRED_SECONDS") or 55),
     }

@@ -39,16 +39,16 @@ ENV_KEYS = ("YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET", "YOUTUBE_REFRESH_TOKEN
 class _Catcher(http.server.BaseHTTPRequestHandler):
     """Single-shot loopback listener for the OAuth redirect."""
 
-    code: str | None = None
-    error: str | None = None
+    # Class-level storage for the auth result
+    _result: dict[str, str] = {}
 
     def do_GET(self):  # noqa: N802
         params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         if "code" in params:
-            type(self).code = params["code"][0]
+            type(self)._result["code"] = params["code"][0]
             body = b"<h2>Authorised.</h2><p>Close this tab and return to the terminal.</p>"
         else:
-            type(self).error = params.get("error", ["no code"])[0]
+            type(self)._result["error"] = params.get("error", ["no code"])[0]
             body = b"<h2>Authorisation failed.</h2><p>See the terminal.</p>"
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -145,17 +145,17 @@ def main() -> int:
         pass
 
     waited = 0.0
-    while _Catcher.code is None and _Catcher.error is None and waited < args.timeout:
+    while "code" not in _Catcher._result and "error" not in _Catcher._result and waited < args.timeout:
         threading.Event().wait(0.5)
         waited += 0.5
     server.shutdown()
 
-    if _Catcher.error or not _Catcher.code:
-        print(f"   No authorisation code received ({_Catcher.error or 'timed out'}).", file=sys.stderr)
+    if _Catcher._result.get("error") or not _Catcher._result.get("code"):
+        print(f"   No authorisation code received ({_Catcher._result.get('error') or 'timed out'}).", file=sys.stderr)
         return 1
 
     token = requests.post(TOKEN_URL, data={
-        "client_id": client_id, "client_secret": client_secret, "code": _Catcher.code,
+        "client_id": client_id, "client_secret": client_secret, "code": _Catcher._result["code"],
         "grant_type": "authorization_code", "redirect_uri": redirect_uri,
     }, timeout=30)
     if token.status_code != 200:

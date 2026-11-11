@@ -14,12 +14,13 @@ All strategies stop on quota/auth errors instead of hammering the API, and recor
 
 import base64
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 import requests
 
-from scenes import CHARACTER, STYLE
+from scenes import CHARACTER, STYLE, api_error_detail, is_quota_error
 
 logger = logging.getLogger(__name__)
 
@@ -68,13 +69,26 @@ def decode_image_response(resp: requests.Response) -> bytes:
 
 
 def _classify(status: int, text: str) -> str:
+    """Map a failed Workers AI image call to the pipeline's failure vocabulary.
+
+    Quota is detected from the body as well as the status: 4006 ('used up your daily free
+    allocation of 10,000 neurons') arrives as a 429, but the allocation is shared with the
+    planner, which is why the run has to stop rather than retry.
+    """
+    if status == 429 or is_quota_error(text):
+        return "quota_exhausted"
     if status in (401, 403):
         return "plan_restricted" if "free plan" in text.lower() else f"auth_{status}"
     if status in (404, 410) or (status == 400 and "7000" in text):
         return "model_missing"
-    if status == 429:
-        return "quota_exhausted"
     return f"status_{status}"
+
+
+def _failed(label: str, resp: requests.Response) -> ImageResult:
+    """Log why an image call failed, then map it to the error vocabulary."""
+    logger.error("Workers AI image %s -> %s (%s)", label, resp.status_code,
+                 api_error_detail(resp))
+    return ImageResult(ok=False, error=_classify(resp.status_code, resp.text))
 
 
 def generate_fresh(prompt: str, cfa_token: str, account_id: str) -> ImageResult:
@@ -88,7 +102,7 @@ def generate_fresh(prompt: str, cfa_token: str, account_id: str) -> ImageResult:
     except requests.RequestException as exc:  # noqa: BLE001
         return ImageResult(ok=False, error=f"request_failed:{exc}")
     if resp.status_code != 200:
-        return ImageResult(ok=False, error=_classify(resp.status_code, resp.text))
+        return _failed(SCHNELL, resp)
     try:
         return ImageResult(ok=True, data=decode_image_response(resp))
     except ValueError as exc:
@@ -108,11 +122,31 @@ def generate_edit(reference: bytes, prompt: str, cfa_token: str, account_id: str
     except requests.RequestException as exc:  # noqa: BLE001
         return ImageResult(ok=False, error=f"request_failed:{exc}")
     if resp.status_code != 200:
-        return ImageResult(ok=False, error=_classify(resp.status_code, resp.text))
+        return _failed(KLEIN, resp)
     try:
         return ImageResult(ok=True, data=decode_image_response(resp))
     except ValueError as exc:
         return ImageResult(ok=False, error=f"bad_response:{exc}")
+
+
+def frame_index(path: Path) -> int:
+    """Numeric shot index of a frame file."""
+    match = re.search(r"(\d+)", path.stem)
+    return int(match.group(1)) if match else 10 ** 6
+
+
+def load_frames(img_dir: Path) -> list[Path]:
+    """Frames in shot order.
+
+    Sorted numerically, not lexicographically: `sorted()` puts `frame_10` before `frame_2`, which
+    silently reorders every short long enough to reach double digits.
+    """
+    extension_rank = {".jpg": 0, ".jpeg": 0, ".png": 1, ".webp": 2}
+    best: dict[int, Path] = {}
+    for path in sorted(img_dir.glob("frame_*.*"),
+                       key=lambda p: (frame_index(p), extension_rank.get(p.suffix.lower(), 3))):
+        best.setdefault(frame_index(path), path)
+    return [best[index] for index in sorted(best)]
 
 
 def crop_grid(sheet_path: Path, out_dir: Path, count: int, columns: int = 3) -> list[Path]:
