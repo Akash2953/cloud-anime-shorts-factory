@@ -41,14 +41,18 @@ class _Catcher(http.server.BaseHTTPRequestHandler):
 
     # Class-level storage for the auth result
     _result: dict[str, str] = {}
+    code: str | None = None
+    error: str | None = None
 
     def do_GET(self):  # noqa: N802
         params = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         if "code" in params:
             type(self)._result["code"] = params["code"][0]
+            type(self).code = params["code"][0]
             body = b"<h2>Authorised.</h2><p>Close this tab and return to the terminal.</p>"
         else:
             type(self)._result["error"] = params.get("error", ["no code"])[0]
+            type(self).error = params.get("error", ["no code"])[0]
             body = b"<h2>Authorisation failed.</h2><p>See the terminal.</p>"
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")

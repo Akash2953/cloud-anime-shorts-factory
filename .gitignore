@@ -9,3 +9,7 @@ models/
 build/
 test_*.wav
 test_*.mp4
+graphify-out/
+.prepush-backup/
+pipeline.log
+state.json.bak
