@@ -283,7 +283,7 @@ class TestPromptAnchoring(unittest.TestCase):
                  "Image 1: Cyberpunk art style, rainy skyline, emotional beat of awe.\n"
                  "Image 2: Anime style, hooded girl on a rooftop, cool lighting.\n")
         with patch("scenes._openrouter", return_value=reply):
-            shots, prompts, fallback, _arc = plan_shorts_detailed(theme="lantern city",
+            shots, prompts, fallback, _arc, _title = plan_shorts_detailed(theme="lantern city",
                                                                   character=CHARACTER, api_key="k")
         self.assertFalse(fallback)
         self.assertIn("raincoat", prompts[2])
@@ -396,7 +396,7 @@ class TestNarrationDensity(unittest.TestCase):
             "the last time she stood here there were twelve of them and now there are only "
             "eleven left.", "Gold eyes. Targeting.")
         with patch("scenes._openrouter", side_effect=[prose, captions]) as planner:
-            shots, _, fallback, _ = plan_shorts_detailed(theme="t", api_key="k", want=8,
+            shots, _, fallback, _, _title = plan_shorts_detailed(theme="t", api_key="k", want=8,
                                                         target_seconds=55)
         self.assertEqual(planner.call_count, 2)              # one repair, then it stops
         self.assertGreater(_spoken_words(shots), 15)
@@ -418,7 +418,7 @@ class TestPlannerCountRequest(unittest.TestCase):
         from unittest.mock import patch
         from scenes import plan_shorts_detailed
         with patch("scenes._openrouter", return_value=detailed_reply(8)) as planner:
-            shots, _, _, _ = plan_shorts_detailed(theme="lantern city", api_key="k", want=8)
+            shots, _, _, _, _title = plan_shorts_detailed(theme="lantern city", api_key="k", want=8)
         self.assertEqual(len(shots), 8)
         sent = planner.call_args[0][0]
         self.assertIn("exactly 8 shots", sent[0]["content"])
@@ -429,7 +429,7 @@ class TestPlannerCountRequest(unittest.TestCase):
         from scenes import plan_shorts_detailed
         with patch("scenes._openrouter",
                    side_effect=[detailed_reply(3), detailed_reply(6)]) as planner:
-            shots, _, fallback, _arc = plan_shorts_detailed(theme="lantern city", api_key="k", want=8)
+            shots, _, fallback, _arc, _title = plan_shorts_detailed(theme="lantern city", api_key="k", want=8)
         self.assertEqual(planner.call_count, 2)
         self.assertEqual(len(shots), 6)
         self.assertFalse(fallback)
@@ -447,7 +447,7 @@ class TestPlannerCountRequest(unittest.TestCase):
         from scenes import plan_shorts_detailed
         with patch("scenes._workers_ai") as workers, \
              patch("scenes._openrouter", return_value=detailed_reply(13)):
-            shots, _, fallback, _arc = plan_shorts_detailed(theme="lantern city", api_key="k", want=13)
+            shots, _, fallback, _arc, _title = plan_shorts_detailed(theme="lantern city", api_key="k", want=13)
         workers.assert_not_called()
         self.assertEqual((len(shots), fallback), (13, False))
 
@@ -455,7 +455,7 @@ class TestPlannerCountRequest(unittest.TestCase):
         from unittest.mock import patch
         from scenes import plan_shorts_detailed
         with patch("scenes._openrouter") as orouter:
-            shots, _, fallback, _arc = plan_shorts_detailed(theme="lantern city", api_key="")
+            shots, _, fallback, _arc, _title = plan_shorts_detailed(theme="lantern city", api_key="")
         orouter.assert_not_called()
         self.assertEqual((shots, fallback), ([], True))
 

@@ -182,6 +182,14 @@ Shot N:
 
 Begin with a count line: "Short 1: N shots, M images."
 
+**Before the count line, state the story's name:**
+```
+Title: <3-7 words, the story's own name, no date, no "Anime Short", no part number>
+```
+The title is what the video is published as, so it must name this story ("The Lantern She
+Left Burning"), not describe the format. Do not put "Part 1" in it — the publisher adds the
+part number itself.
+
 **After all shots, add this section header exactly:**
 ```
 --- IMAGE GENERATION PROMPTS ---
@@ -747,6 +755,44 @@ def _declared_count(text: str) -> int:
     return int(match.group(1)) if match else 0
 
 
+def parse_title(text: str) -> str:
+    """Read the story title the planner states as `Title: ...`.
+
+    The title is what the upload is named after, so it has to be the story's own name rather
+    than the series id (which used to be a date, producing "Anime Short #1/2 — 2026-11-12").
+    Returns "" when the planner did not state one; the caller then falls back to a title built
+    from the opening narration.
+    """
+    match = re.search(r"^\s*\**\s*title\s*\**\s*[:=]\s*\**\s*(.+?)\s*\**\s*$",
+                      text or "", re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return ""
+    title = match.group(1).strip().strip("\"'`*")
+    # A title is a name, not a sentence: drop a trailing period and any stray markdown.
+    title = re.sub(r"\s+", " ", title).rstrip(".")
+    if len(title) > 90 or len(title.split()) > 12:
+        logger.info("Planner title too long (%d chars); ignoring it", len(title))
+        return ""
+    return title
+
+
+def fallback_title(shots: list[Shot]) -> str:
+    """Build a title from the opening narration when the planner did not name the story.
+
+    Takes the first clause of the first spoken line and title-cases it, so an unnamed story
+    still uploads as something readable instead of a date.
+    """
+    for shot in shots:
+        line = shot.speech
+        if not line:
+            continue
+        clause = re.split(r"[,.;:!?]", line, maxsplit=1)[0].strip()
+        words = clause.split()[:7]
+        if words:
+            return " ".join(words).strip("\"'")
+    return ""
+
+
 def _declared_arc(text: str, lo: int, hi: int) -> int:
     """Read the arc length the planner chose (`Arc: N parts`), clamped to what the run allows."""
     match = (re.search(r"^\s*\**\s*arc\s*\**\s*[:=]\s*\**\s*(\d+)\s*parts?\b", text, re.I | re.M)
@@ -799,7 +845,7 @@ def plan_shorts_detailed(
     `parts_range`, and states it as an `Arc: N parts` line in the same reply — one request, not two.
     Its answer comes back as the fourth element and is then pinned in `state.json`.
 
-    Returns (shots, image_prompts, used_fallback, total_parts).
+    Returns (shots, image_prompts, used_fallback, total_parts, title).
     """
     decide_arc = total_parts is None
     if decide_arc:
@@ -876,7 +922,7 @@ def plan_shorts_detailed(
 
     if not text:
         logger.warning("Detailed planner unavailable; falling back to basic plan_shots")
-        return [], {}, True, 1 if decide_arc else total_parts
+        return [], {}, True, 1 if decide_arc else total_parts, ""
 
     shots, image_prompts = parse_detailed_response(text)
 
@@ -911,7 +957,7 @@ def plan_shorts_detailed(
 
     if not shots:
         logger.warning("Detailed planner returned 0 shots; falling back")
-        return [], {}, True, 1 if decide_arc else total_parts
+        return [], {}, True, 1 if decide_arc else total_parts, ""
 
     if not image_prompts:
         logger.warning("Planner returned no IMAGE GENERATION PROMPTS section; "
@@ -947,7 +993,12 @@ def plan_shorts_detailed(
 
     logger.info("Detailed scene plan: %d shots, %d unique image prompts",
                 len(shots), len(image_prompts))
-    return shots, image_prompts, False, total_parts
+    title = parse_title(text) or fallback_title(shots)
+    if title:
+        logger.info("Story title: %s", title)
+    else:
+        logger.warning("Planner named no story and no narration to derive one from")
+    return shots, image_prompts, False, total_parts, title
 
 
 PLANNER_MAX_TOKENS = 4096  # Workers AI path only; the OpenRouter path is deliberately uncapped

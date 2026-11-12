@@ -55,6 +55,16 @@ class Defaults:
     )
 
 
+def _as_int(raw: str | None, default: int) -> int:
+    """Parse an int from env, accepting hex (`0xC001`) as well as decimal."""
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        return int(str(raw).strip(), 0)
+    except ValueError:
+        return default
+
+
 def _parts_bound(raw: str | None, default: int) -> int:
     try:
         return max(1, min(int(raw or default), MAX_PARTS))
@@ -116,4 +126,33 @@ def load_config() -> dict:
         # Shots per part. 0 = derive from PREFERRED_SECONDS (~6.8s per cut).
         "SHOTS_PER_PART": int(os.environ.get("SHOTS_PER_PART") or 0),
         "PREFERRED_SECONDS": float(os.environ.get("PREFERRED_SECONDS") or 55),
+        # Word-synced captions. WORD_CAPTIONS off reverts to no captions (existing behaviour).
+        # ACCENT_PALETTE is a CSV of hex codes (twelve-hour cycle per accent word in a group).
+        # CAPTION_FONT empty -> captions.py probes the OS-default candidates.
+        "WORD_CAPTIONS": os.environ.get("WORD_CAPTIONS", "true").lower() == "true",
+        "ACCENT_PALETTE": tuple(
+            s.strip() for s in os.environ.get("ACCENT_PALETTE", "#FF2D55,#FFD60A,#00E5FF").split(",")
+            if s.strip()
+        ),
+        "CAPTION_FONT": os.environ.get("CAPTION_FONT", ""),
+        # base.en is the sweet spot for English narration: 150 MB cacheable, ~600 MB RAM peak,
+        # ~1-3 s per 60 s short on a 2-core CPU. Larger models drift less but cost disk/RAM/time.
+        "WHISPER_MODEL": os.environ.get("WHISPER_MODEL", "base.en"),
+        # 350 ms = the example case ('she ran towards' -> ['she ran','towards']).
+        "WORD_GAP_MS": int(os.environ.get("WORD_GAP_MS", "350")),
+        # Caption entrance/exit: none | fade | slide (default). See render.render_narration.
+        "CAPTION_ANIMATION": os.environ.get("CAPTION_ANIMATION", "slide").lower(),
+        # End-of-short call to action. 0 disables it entirely.
+        "CTA_SECONDS": float(os.environ.get("CTA_SECONDS", 4.0)),
+        # The CTA is spoken by a brighter, faster voice than the narration so it does not read
+        # as one more story beat. af_bella is measurably brighter than af_heart (see cta.py).
+        "CTA_VOICE": os.environ.get("CTA_VOICE", "af_bella"),
+        "CTA_SPEED": float(os.environ.get("CTA_SPEED", 1.15)),
+        # Custom thumbnail: burn the story title onto the key frame and upload it.
+        "THUMBNAIL": os.environ.get("THUMBNAIL", "true").lower() == "true",
+        # Background music, mixed into the render. Tracks come from MUSIC_DIR (one per part,
+        # rotated); with an empty folder a synthesized ambient bed stands in so the ducking and
+        # loudness stages still run. MUSIC_SEED varies the bed's texture between runs.
+        "MUSIC_ENABLED": os.environ.get("MUSIC_ENABLED", "true").lower() == "true",
+        "MUSIC_SEED": _as_int(os.environ.get("MUSIC_SEED"), 0xC001),
     }

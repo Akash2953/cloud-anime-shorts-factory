@@ -6,20 +6,31 @@ finished arc can be reproduced; the rotation is `(part - 1) % len(tracks)`,
 which keeps part 1 on the first file forever while every part you add lands on
 its own.
 
-The mixer graph here is the same one I will drop into `render.render_narration`
-once the renderer is rebuilt around it, so the demo script and the production
-pipeline pass through one filter graph.
+`mix_graph()` is the audio half of `render.render_narration`'s filter graph: the renderer calls
+it directly, so the demo and the production pipeline pass through one graph rather than two
+drifting copies.
+
+When `MUSIC_DIR` is empty the pipeline falls back to `synthesize_ambient_bed()` so the ducking
+and loudness stages always run. Drop real tracks into the folder (with a `<track>.json`
+sidecar for attribution) and the same graph uses them with no code change.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
 
+logger = logging.getLogger(__name__)
+
 from audio import SAMPLE_RATE, write_wav
 
-MUSIC_DIR = Path(__import__("os").environ.get("MUSIC_DIR", "build/music"))
+# `assets/music` is the tracked location: `build/` is gitignored, so a licensed track dropped
+# there would never reach CI. `build/music` is still scanned as a fallback for the original
+# demo workflow.
+MUSIC_DIR = Path(__import__("os").environ.get("MUSIC_DIR", "assets/music"))
+LEGACY_MUSIC_DIR = Path("build/music")
 MUSIC_EXTS = (".wav", ".mp3", ".m4a", ".ogg", ".flac")
 
 # Quiet subtitles for a YouTube description credit. The orchestrator will append
@@ -30,12 +41,24 @@ MUSIC_NOTE = (
 
 
 def enumerate_music(music_dir: Path | None = None) -> list[Path]:
-    """Sorted list of usable audio files. Empty when the folder is missing."""
-    music_dir = music_dir or MUSIC_DIR
-    if not music_dir.exists():
-        return []
-    return sorted(p for p in music_dir.iterdir()
-                  if p.suffix.lower() in MUSIC_EXTS and p.is_file())
+    """Sorted list of usable audio files. Empty when the folders are missing.
+
+    An explicit `music_dir` is searched alone; otherwise `MUSIC_DIR` then the legacy
+    `build/music` folder, so both layouts work without configuration.
+    """
+    if music_dir is not None:
+        dirs = [music_dir]
+    else:
+        dirs = [MUSIC_DIR]
+        if LEGACY_MUSIC_DIR != MUSIC_DIR:
+            dirs.append(LEGACY_MUSIC_DIR)
+    tracks: list[Path] = []
+    for directory in dirs:
+        if not directory.exists():
+            continue
+        tracks.extend(p for p in directory.iterdir()
+                      if p.suffix.lower() in MUSIC_EXTS and p.is_file())
+    return sorted(tracks)
 
 
 def pick_music(part_num: int, music_dir: Path | None = None) -> Path | None:
@@ -49,15 +72,19 @@ def pick_music(part_num: int, music_dir: Path | None = None) -> Path | None:
 # ffmpeg filter graph fragment. Inputs: [voice, music]. Output: `[aout]`.
 # Placeholders substituted by `mix_graph()`. Drops to mono before sidechain
 # because Kokoro's mono key links to the same channel it ducks.
+# `normalize=0` on amix is load-bearing: the default divides by the input count, so a 2-input
+# mix halves the voice and the narration arrives 6 dB quieter than in a voice-only render.
+# `apad` on the voice lets amix run to the music's length instead of stopping at the last word,
+# which is what keeps the bed under the closing call to action.
 _MIX_GRAPH = (
-    "[1:a]aloop=loop=-1:size=2e9,atrim=0:duration={dur:.3f},"
+    "[{music_index}:a]aloop=loop=-1:size=2e9,atrim=0:duration={dur:.3f},"
     "afade=t=in:st=0:d={fade_in:.2f},"
     "afade=t=out:st={fade_out_start:.3f}:d={fade_out:.2f},"
     "volume={music_db}dB[mix];"
-    "[0:a]asplit=2[voice][key];"
+    "[{voice_index}:a]apad,asetpts=PTS-STARTPTS,asplit=2[voice][key];"
     "[mix][key]sidechaincompress=threshold={thf}:ratio={ratio}:"
     "attack={atk}:release={rel}[ducked];"
-    "[voice][ducked]amix=inputs=2:dropout_transition=0,"
+    "[voice][ducked]amix=inputs=2:dropout_transition=0:normalize=0,"
     "loudnorm=I=-14:TP=-1.5:LRA=11[aout]"
 )
 
@@ -65,6 +92,8 @@ _MIX_GRAPH = (
 def mix_graph(
     duration_seconds: float,
     *,
+    voice_index: int = 0,
+    music_index: int = 1,
     fade_in: float = 1.5,
     fade_out: float = 2.5,
     music_db: float = -18.0,
@@ -73,12 +102,20 @@ def mix_graph(
     attack_ms: int = 300,
     release_ms: int = 500,
 ) -> str:
-    """Build the per-run graph string. The `[aout]` label is what render maps."""
+    """Build the per-run graph string. The `[aout]` label is what render maps.
+
+    `voice_index` / `music_index` exist because `render_narration` puts the image inputs first:
+    the narration is rarely input 0 in the real graph, even though it is in the tests.
+    """
+    # Never let the fade-out start before the track does: a bed shorter than the fade would
+    # otherwise open already fading.
+    fade_out = max(0.1, min(fade_out, duration_seconds / 3))
     fade_start = max(0.0, duration_seconds - fade_out)
     return _MIX_GRAPH.format(
         dur=duration_seconds, fade_in=fade_in, fade_out=fade_out,
         fade_out_start=fade_start, music_db=music_db, thf=threshold_pct,
         ratio=ratio, atk=attack_ms, rel=release_ms,
+        voice_index=voice_index, music_index=music_index,
     )
 
 
@@ -143,12 +180,51 @@ def synthesize_ambient_bed(
     return bed
 
 
-def write_fallback_bed(path: Path, duration_seconds: float) -> Path:
+def write_fallback_bed(path: Path, duration_seconds: float, *, seed: int = 0xC001) -> Path:
     """Synthesise the demo bed to a wav file ffmpeg can ingest.
 
     Returns the path written. Render never calls this directly: it expects a
     real file from MUSIC_DIR. This helper exists only so option 2 can be
     exercised end-to-end before any music is licensed.
     """
-    bed = synthesize_ambient_bed(duration_seconds)
+    bed = synthesize_ambient_bed(duration_seconds, seed=seed)
     return write_wav(path, bed)
+
+
+def credit_for(track: Path) -> str | None:
+    """Attribution line for a track, from an optional `<track>.json` sidecar.
+
+    Keyed on the file so the credit travels with the audio:
+
+        {"title": "...", "artist": "...", "license": "CC-BY 4.0", "url": "..."}
+
+    Returns None when there is no sidecar, which is the correct answer for CC0/"no attribution"
+    libraries and for the synthesised bed.
+    """
+    sidecar = track.with_suffix(track.suffix + ".json")
+    if not sidecar.exists():
+        return None
+    try:
+        import json
+        meta = json.loads(sidecar.read_text(encoding="utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("could not read %s (%s)", sidecar, exc)
+        return None
+    try:
+        return MUSIC_NOTE.format(**{k: meta.get(k, "") for k in
+                                    ("title", "artist", "license", "url")}).strip()
+    except (KeyError, IndexError):
+        return None
+
+
+def resolve_music(part_num: int, duration_seconds: float, *, bed_path: Path,
+                  seed: int = 0xC001) -> tuple[Path, bool]:
+    """Pick this part's track, or synthesise the fallback bed when none are licensed.
+
+    Returns (path, is_fallback). The flag lets the caller skip an attribution line for the
+    generated bed, which needs no credit.
+    """
+    track = pick_music(part_num)
+    if track is not None:
+        return track, False
+    return write_fallback_bed(bed_path, duration_seconds, seed=seed), True

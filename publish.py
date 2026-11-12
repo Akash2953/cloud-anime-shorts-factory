@@ -84,6 +84,35 @@ def upload_video(
         return None
 
 
+def upload_thumbnail(video_id: str, access_token: str, image_bytes: bytes) -> bool:
+    """Attach a custom thumbnail to an uploaded video.
+
+    YouTube's `thumbnails.set` takes the image as the raw request body (`uploadType=media`), not
+    as multipart. It costs ~50 quota units and needs a phone-verified channel; a channel that
+    is not verified returns 403, which is logged and treated as "no thumbnail" rather than a
+    failed upload — the video is already live at that point.
+
+    Limits: JPEG/PNG, under 2 MB, and at least 1280x720.
+    """
+    url = ("https://www.googleapis.com/upload/youtube/v3/thumbnails/set"
+           f"?videoId={video_id}&uploadType=media")
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "image/jpeg",
+        "Content-Length": str(len(image_bytes)),
+    }
+    try:
+        resp = requests.post(url, headers=headers, data=image_bytes, timeout=120)
+        if resp.status_code not in (200, 201):
+            logger.warning("Thumbnail upload failed for %s: %s", video_id, resp.text[:400])
+            return False
+        logger.info("Thumbnail set for video %s", video_id)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Thumbnail upload exception for %s: %s", video_id, exc)
+        return False
+
+
 def set_privacy(video_id: str, access_token: str, privacy_status: str = "public") -> bool:
     """Flip an already-uploaded video's visibility after manual validation.
 

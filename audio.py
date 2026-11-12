@@ -88,10 +88,16 @@ class Narration:
         self.speed = speed
         logger.info("Kokoro loaded (voice=%s, speed=%.2f)", voice, speed)
 
-    def wav(self, text: str, *, speed: float | None = None) -> np.ndarray:
+    def wav(self, text: str, *, speed: float | None = None,
+            voice: str | None = None) -> np.ndarray:
+        """Synthesise one line. `voice` overrides the instance voice for this call only.
+
+        The CTA uses a different voice from the narration (brighter, faster) without paying to
+        load a second Kokoro model — the voice is a style matrix, not a separate network.
+        """
         audio, sr = self._k.create(
             text,
-            voice=self.voice,
+            voice=voice or self.voice,
             speed=self.speed if speed is None else speed,
             lang="en-us",
         )

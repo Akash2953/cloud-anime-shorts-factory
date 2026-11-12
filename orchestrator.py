@@ -21,8 +21,10 @@ import numpy as np
 from audio import Narration, join_with_gaps, write_wav, SAMPLE_RATE
 from config import load_config, Limits
 from images import load_frames, produce_images
-from publish import exchange_refresh_token, upload_video
+from publish import exchange_refresh_token, upload_thumbnail, upload_video
 from render import render_narration
+# captions is imported lazily inside run_pipeline; an offline or fast-iteration run that doesn't
+# have faster-whisper installed shouldn't pay its import cost on startup.
 from scenes import (MAX_PARTS, Shot, make_character, plan_arc, plan_shorts_detailed,
                     reuse_image_refs, shots_for_duration, unique_prompts,
                     validate_story_position)
@@ -39,6 +41,37 @@ MIN_CUT = 0.8        # shortest a still may be held, so a silent beat cannot fla
 
 def load_state(path: Path) -> dict:
     return parse_state(path.read_text(encoding="utf-8") if path.exists() else None)
+
+
+def story_title(state: dict) -> str:
+    """The story's own name, for the upload title and the thumbnail.
+
+    Older state has no `title` (it was never asked for), so fall back to the first narration
+    line rather than to the series id — the id is a date, and a date is not a title.
+    """
+    series = state.get("series") or {}
+    title = (series.get("title") or "").strip()
+    if title:
+        return title
+    for part in series.get("parts") or []:
+        for shot in part or []:
+            line = (shot.get("narration") or "").strip()
+            if line and line.lower() not in ("none", "silent", ""):
+                clause = line.split(",")[0].split(".")[0].strip()
+                return " ".join(clause.split()[:7])
+    return "Untitled Story"
+
+
+def story_upload_title(state: dict, part: int, total_parts: int) -> str:
+    """`<story title> #1/2` for an arc, plain `<story title>` for a one-part story.
+
+    The old title was "Anime Short #1/2 — 2026-11-12": a format label plus the series id, which
+    is a date. Neither tells a viewer what the story is, and the date is meaningless to them.
+    """
+    title = story_title(state)
+    if total_parts > 1:
+        return f"{title} #{part}/{total_parts}"
+    return title
 
 
 def advance_series(state: dict, uploaded_part: int) -> None:
@@ -112,13 +145,17 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None,
         logger.info("Planning part %d of %d (%d line(s) of story so far)",
                     part_number, total_parts, len(story_so_far))
 
-    shots, image_prompts, fallback, declared_parts = plan_shorts_detailed(
+    plan_result = plan_shorts_detailed(
         theme="", character=character, api_key=cfg.get("OPENROUTER_API_KEY", ""),
         want=want, target_seconds=target_seconds,
         part=part_number, total_parts=None if decide_arc else total_parts,
         story_so_far=story_so_far,
         parts_range=(int(cfg.get("PARTS_MIN") or 1), int(cfg.get("PARTS_MAX") or MAX_PARTS)),
     )
+    shots, image_prompts, fallback, declared_parts = plan_result[:4]
+    # The planner also names the story; that name is the upload title and the thumbnail text.
+    # Tolerate a 4-tuple so stubs and older callers keep working.
+    plan_title = plan_result[4] if len(plan_result) > 4 else ""
     degraded = fallback
     if decide_arc and not fallback:
         total_parts = declared_parts or 1
@@ -162,6 +199,8 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None,
     series = {
         "id": today_key(),
         "theme": "",
+        # The story's own name, used for the upload title and the thumbnail. Never the date.
+        "title": plan_title,
         "character": character,  # this arc's protagonist, so it is not shared across arcs
         "parts": [[s.as_dict() for s in shots]],
         "total_parts": total_parts,
@@ -271,6 +310,21 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
                        len(frames), len(shots), min(len(frames), len(shots)))
         shots = shots[:len(frames)]
 
+    # End-of-short call to action: one spoken line over the held final frame. It is appended as a
+    # normal beat so it flows through the same timing and caption pipeline, but it is synthesised
+    # with a brighter, faster voice — delivered in the storyteller's measured tone it reads as one
+    # more story beat and the viewer stops listening. The last frame is reused, which is what
+    # makes the picture hold while the narrator speaks.
+    cta_seconds = float(cfg.get("CTA_SECONDS") or 0)
+    cta_index: int | None = None
+    if cta_seconds > 0 and frames:
+        from cta import cta_shot
+        cta = cta_shot(part_num, total_parts, seconds=cta_seconds)
+        shots = shots + [cta]
+        frames = frames + [frames[-1]]
+        cta_index = len(shots) - 1
+        logger.info("CTA beat: %r", cta.speech)
+
     narration_tts = Narration(voice=cfg["KOKORO_VOICE"])
     speech = [shot.speech for shot in shots]
     spoken = [i for i, text in enumerate(speech) if text]
@@ -281,11 +335,34 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
     if not spoken:
         logger.warning("Every beat is silent; the short will render without narration")
 
+    # The CTA is synthesised first, in its own voice, so the story lines can be paced into
+    # whatever time is left. It is never time-scaled: squeezing the ask to fit is what made it
+    # sound like another narration line.
+    cta_audio = None
+    if cta_index is not None and speech[cta_index]:
+        from cta import CTA_SPEED, CTA_VOICE
+        cta_audio = narration_tts.wav(speech[cta_index],
+                                      voice=cfg.get("CTA_VOICE") or CTA_VOICE,
+                                      speed=float(cfg.get("CTA_SPEED") or CTA_SPEED))
+        logger.info("CTA voice=%s speed=%.2f, %.1fs",
+                    cfg.get("CTA_VOICE") or CTA_VOICE,
+                    float(cfg.get("CTA_SPEED") or CTA_SPEED),
+                    len(cta_audio) / SAMPLE_RATE)
+
     # Only spoken beats are synthesised; the silent ones become their planned hold.
-    budget = target_seconds - BEAT_GAP * (len(shots) - 1) - TAIL_HOLD - silent_hold
-    raw = [narration_tts.wav(speech[i]) for i in spoken]
-    scaled, speed = (narration_tts.synth_scaled([speech[i] for i in spoken], target_seconds=budget)
-                     if spoken else ([], 1.0))
+    story_positions = [p for p, i in enumerate(spoken) if i != cta_index]
+    story_texts = [speech[spoken[p]] for p in story_positions]
+    cta_hold = len(cta_audio) / SAMPLE_RATE if cta_audio is not None else 0.0
+    budget = (target_seconds - BEAT_GAP * (len(shots) - 1) - TAIL_HOLD - silent_hold
+              - cta_hold)
+    raw = [narration_tts.wav(t) for t in story_texts]
+    scaled_story, speed = (narration_tts.synth_scaled(story_texts, target_seconds=budget)
+                           if story_texts else ([], 1.0))
+    # Rebuild the per-beat segment list in `spoken` order, splicing the CTA back in.
+    scaled: list[np.ndarray] = []
+    story_iter = iter(scaled_story)
+    for i in spoken:
+        scaled.append(cta_audio if i == cta_index else next(story_iter))
     natural = sum(len(a) for a in scaled) / SAMPLE_RATE
 
     beats, audio, durations = beat_track(shots, scaled)
@@ -305,10 +382,66 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
     audio_path = Path("build/narration.wav")
     write_wav(audio_path, audio)
 
+    # Background music, mixed at render time so --render-only produces the same audio that
+    # ships. One track per part, rotated deterministically; when no licensed tracks are in
+    # MUSIC_DIR the synthesized ambient bed stands in, so the ducking and loudness stages run
+    # instead of being skipped.
+    music_path: Path | None = None
+    music_credit: str | None = None
+    if cfg.get("MUSIC_ENABLED", True):
+        try:
+            from music import credit_for, resolve_music
+            music_path, is_bed = resolve_music(
+                part_num, total, bed_path=Path("build/music_bed.wav"),
+                seed=int(cfg.get("MUSIC_SEED") or 0xC001),
+            )
+            if is_bed:
+                logger.info("Music: synthesized ambient bed (no tracks in MUSIC_DIR)")
+            else:
+                logger.info("Music: %s", music_path.name)
+                music_credit = credit_for(music_path)
+        except Exception as exc:  # noqa: BLE001 — music must not abort a render
+            logger.warning("Music stage failed (%s); rendering without a bed", exc)
+            music_path = None
+
+    # Optional word-synced captions: faster-whisper aligns the joined narration -> per-word
+    # timestamps -> pack into 1/2/3-word groups -> render one PNG each -> ffmpeg overlay them.
+    # The whole stage is wrapped so a missing model, misfit font or whisper drift logs and
+    # leaves `overlays=None` — the existing line-level render path stays untouched.
+    overlays: list[tuple[Path, float, float]] | None = None
+    if cfg.get("WORD_CAPTIONS", True):
+        try:
+            from captions import build_caption_overlays, DEFAULT_ACCENT_PALETTE
+            nar_text = " ".join(s.speech for s in shots if s.speech).strip()
+            cap_dir = Path("build/captions")
+            # The CTA is shown as one static centred block with a subscribe button, not as
+            # word-synced groups. Its window is the last beat's hold.
+            cta_block = None
+            if cta_index is not None and speech[cta_index]:
+                cta_start = sum(durations[:cta_index])
+                cta_block = (speech[cta_index], cta_start, cta_start + durations[cta_index])
+            overlays = build_caption_overlays(
+                audio_path,
+                nar_text,
+                audio_duration=len(audio) / SAMPLE_RATE,
+                out_dir=cap_dir,
+                accent_palette=tuple(cfg.get("ACCENT_PALETTE") or DEFAULT_ACCENT_PALETTE),
+                font_path=cfg.get("CAPTION_FONT") or None,
+                whisper_model=cfg.get("WHISPER_MODEL", "base.en"),
+                gap_tight_ms=int(cfg.get("WORD_GAP_MS", 350)),
+                cta_block=cta_block,
+            )
+            logger.info("Captions: %d overlay PNGs prepared", len(overlays))
+        except Exception as exc:  # noqa: BLE001 — captions must not abort the upload
+            logger.warning("Caption generation failed (%s); rendering without subtitles", exc)
+            overlays = None
+
     logger.info("Render: %d beats, %.1fs total, audio=narration.wav",
                 len(durations), total)
     video_path = Path("output_short.mp4")
-    if not render_narration(frames, durations, audio_path, video_path, fps=fps):
+    if not render_narration(frames, durations, audio_path, video_path, fps=fps, overlays=overlays,
+                            caption_animation=cfg.get("CAPTION_ANIMATION", "slide"),
+                            music_path=music_path):
         logger.error("Rendering failed; aborting before upload")
         return
 
@@ -322,14 +455,17 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
     if not access_token:
         logger.error("YouTube token exchange failed; queue untouched, retrying tomorrow")
         return
-    title = f"Anime Short #{part_num}/{total_parts} — {state.get('series', {}).get('id', 'new')}"
+    title = story_upload_title(state, part_num, total_parts)
     description_lines = [
         f"# Part {part_num} of {total_parts}",
         "",
         "# Narration:",
     ]
-    for i, line in enumerate((s.speech for s in shots if s.speech), 1):
+    # The CTA is not story, so it stays out of the description's narration list.
+    for i, line in enumerate((s.speech for s in shots if s.speech and s.narrative_role != "call_to_action"), 1):
         description_lines.append(f"{i}. {line}")
+    if music_credit:
+        description_lines += ["", music_credit]
     description = "\n".join(description_lines)
     tags = ["anime", "shorts", "storytime", "mystery", "lantern",
             "rainy city", "vertical video"]
@@ -339,6 +475,18 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
     if not video_id:
         logger.error("Upload failed; queue untouched, retrying the same part tomorrow")
         return
+
+    # Custom thumbnail: the story's key frame with its title burned in. Optional — a channel
+    # without phone verification gets a 403 here, which must not fail an already-live upload.
+    if cfg.get("THUMBNAIL", True):
+        try:
+            from thumbnail import pick_key_frame, render_thumbnail
+            key_frame = pick_key_frame(shots, frames)
+            thumb_path = Path("build/thumbnail.jpg")
+            if key_frame and render_thumbnail(key_frame, story_title(state), thumb_path):
+                upload_thumbnail(video_id, access_token, thumb_path.read_bytes())
+        except Exception as exc:  # noqa: BLE001 — never fail the upload over a thumbnail
+            logger.warning("Thumbnail stage failed (%s); video is uploaded without one", exc)
 
     daily = state.setdefault("daily", {}).setdefault(today_key(), {})
     daily["uploads"] = daily.get("uploads", 0) + 1

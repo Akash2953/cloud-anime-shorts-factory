@@ -24,10 +24,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install system dependencies (FFmpeg)
+      - name: Install system dependencies (FFmpeg, DejaVu Bold for captions)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get install -y ffmpeg fonts-dejavu fonts-dejavu-core
 
       - name: Install Python dependencies
         run: |
@@ -40,8 +40,26 @@ jobs:
           path: models/kokoro
           key: kokoro-v1.0-${{ runner.os }}
 
+      - name: Cache Whisper model (base.en, ~150 MB; needed by captions.py)
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-base-en-v1-${{ runner.os }}
+          # After faster-whisper's ctranslate2 switch, the model is fetched on first call and
+          # cached under HF_HOME. Pin env so the cache path stays stable across runs.
+
       - name: Provision Kokoro TTS
         run: python audio.py --download
+
+      # Warm whisper by constructing the model — downloads + initialises ctranslate2 once, then
+      # caches the model files into ~/.cache/huggingface (next cache step). Without this, the
+      # first daily run pays a 30-60 s first-call cost inside run_pipeline and risks timeout.
+      - name: Warm Faster-Whisper model download
+        run: |
+          python -c "
+          from faster_whisper import WhisperModel
+          WhisperModel('base.en', device='cpu', compute_type='int8')
+          "
 
       - name: Run Orchestrator Pipeline (narrated short + YouTube upload)
         env:
@@ -53,6 +71,23 @@ jobs:
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
           KOKORO_VOICE: ${{ vars.KOKORO_VOICE || 'af_heart' }}
           IMAGE_STRATEGY: ${{ vars.IMAGE_STRATEGY || 'edit' }}
+          # Word-synced captions: on/off via var; defaults on. Override ACCENT_PALETTE in
+          # CSV form if you want to rebrand.
+          WORD_CAPTIONS: ${{ vars.WORD_CAPTIONS || 'true' }}
+          ACCENT_PALETTE: ${{ vars.ACCENT_PALETTE || '#FF2D55,#FFD60A,#00E5FF' }}
+          WHISPER_MODEL: ${{ vars.WHISPER_MODEL || 'base.en' }}
+          WORD_GAP_MS: ${{ vars.WORD_GAP_MS || '350' }}
+          # none | fade | slide (default). Animated modes loop each caption strip for its cue.
+          CAPTION_ANIMATION: ${{ vars.CAPTION_ANIMATION || 'slide' }}
+          # Spoken end-of-short CTA over the held last frame. 0 disables it.
+          CTA_SECONDS: ${{ vars.CTA_SECONDS || '4' }}
+          # Custom thumbnail: key frame + story title, uploaded via thumbnails.set.
+          THUMBNAIL: ${{ vars.THUMBNAIL || 'true' }}
+          # Background music, mixed into the render. Point MUSIC_DIR at a tracked folder to ship
+          # licensed tracks (build/ is gitignored); with no tracks the synthesized ambient bed
+          # stands in so the ducking and loudness stages still run.
+          MUSIC_ENABLED: ${{ vars.MUSIC_ENABLED || 'true' }}
+          MUSIC_DIR: ${{ vars.MUSIC_DIR || 'assets/music' }}
           # 'auto' = the planner chooses each story's arc length (PARTS_MIN..PARTS_MAX)
           SERIES_PARTS: ${{ vars.SERIES_PARTS || '1' }}
           PARTS_MIN: ${{ vars.PARTS_MIN || '1' }}
