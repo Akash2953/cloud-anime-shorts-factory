@@ -106,7 +106,9 @@
       "Bash(python -c \"import json;d=json.load\\(open\\('state.json'\\)\\);print\\('\\\\n'.join\\(sorted\\(d.keys\\(\\)\\)\\)\\)\")",
       "Bash(grep -rInaE 'AIza[0-9A-Za-z_-]{20,}|ghp_[A-Za-z0-9]{20,}|github_pat_|sk-[A-Za-z0-9]{20,}|ya29\\\\.|-----BEGIN [A-Z ]*PRIVATE KEY|client_secret[\" ]*[=:]|refresh_token[\" ]*[=:]|xoxb-|AKIA[0-9A-Z]{16}' .prepush-backup/ graphify-out/ pipeline.log state.json.bak state.json .claude/settings.json)",
       "Bash(echo \"=== exit: $? \\(no output above = clean\\) ===\")",
-      "Bash(grep -rInaE 'AIza[0-9A-Za-z_-]{20,}|ghp_|sk-[A-Za-z0-9]{20,}|ya29\\\\.|-----BEGIN' state.json tools/youtube_auth.py .claude/settings.json)"
+      "Bash(grep -rInaE 'AIza[0-9A-Za-z_-]{20,}|ghp_|sk-[A-Za-z0-9]{20,}|ya29\\\\.|-----BEGIN' state.json tools/youtube_auth.py .claude/settings.json)",
+      "Bash(git merge *)",
+      "Bash(git checkout *)"
     ],
     "additionalDirectories": [
       "C:\\Users\\akash\\.claude\\projects\\d--project-cloud-anime-shorts-factory\\tests",
