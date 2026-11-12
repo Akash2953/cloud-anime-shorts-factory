@@ -79,7 +79,26 @@ STYLE = (
 
 # The character signature is deliberately SHORT and placed last in the prompt: a leading
 # paragraph of description overpowers the scene and collapses every frame into a portrait.
-CHARACTER = "a girl in a black hooded raincoat with a red scarf"
+# Each arc gets its own signature (make_character): fixed for the whole arc so every part and
+# every image edit stays consistent, while different arcs draw different protagonists.
+
+_CHARACTER_POOL = (
+    ("a girl", "a boy", "a young woman", "a man", "a child"),
+    ("a black hooded raincoat", "a red trench coat", "a grey hooded poncho",
+     "a navy hooded cloak", "a green hooded jacket", "a charcoal waxed coat"),
+    ("with a red scarf", "with a paper mask", "with glowing goggles",
+     "with a knitted beanie", "with a worn satchel", "with silver rings"),
+)
+
+
+def make_character(series_id: str) -> str:
+    """A short, stable identity signature: unique per arc, fixed within it.
+
+    Seeded by the series id so every part and image edit of one arc keeps the same face, while
+    different arcs come out different. Deterministic, so no LLM call and no spend.
+    """
+    rng = random.Random(series_id or "arc")
+    return f"{rng.choice(_CHARACTER_POOL[0])} in {rng.choice(_CHARACTER_POOL[1])} {rng.choice(_CHARACTER_POOL[2])}"
 
 # Default shot rhythm for a ~45s short: 13 cuts, 2-5s each, roles in narrative order.
 # (shot_size, place, action, story_object, narrative_role, camera, character, seconds)
@@ -173,9 +192,7 @@ frame has to keep rewarding that attention. Each prompt must be fully self-conta
 in this order: (1) art style, (2) setting, time, lighting and mood, (3) composition as a vertical
 9:16 portrait, (4) emotional beat, (5) one or two concrete physical details that sell the place
 (weather on a surface, wear on an object, what the light is landing on).
-Any prompt that shows the girl must describe her with exactly this signature, placed last
-and verbatim: `a girl in a black hooded raincoat with a red scarf`. Do not paraphrase the
-signature and do not add meta-language about engagement hooks — describe only what is in frame.
+__CHARACTER_SIGNATURE__
 
 Keep each field concise and concrete so the output can be extracted programmatically.
 
@@ -226,11 +243,11 @@ class Shot:
             return ""
         return text
 
-    def prompt(self) -> str:
+    def prompt(self, character: str = "") -> str:
         """Scene and action lead; the character signature is short and comes last."""
         size = SHOT_SIZES.get(self.shot_size, "Medium shot")
         obj = "" if self.story_object in ("", "no object") else f" Key object: {self.story_object}."
-        who = f" {CHARACTER}, seen as part of the scene." if self.character else ""
+        who = f" {character}, seen as part of the scene." if self.character and character else ""
         return (
             f"{STYLE}. {size}: {self.place}. {self.action}.{obj} "
             f"Camera: {self.camera.replace('_', ' ')}.{who}"
@@ -524,35 +541,37 @@ _CHARACTER_TOKENS = re.compile(
     r"\b(she|her|hers|herself|girl|girls|hood|hooded|protagonist)\b", re.IGNORECASE)
 
 
-def _strip_signature(text: str) -> str:
+def _strip_signature(text: str, character: str) -> str:
     """Remove the identity signature from a prompt for a frame the shot list says is empty."""
-    text = re.sub(r",?\s*" + re.escape(CHARACTER) + r"(,\s*seen as part of the scene)?", "",
-                  text, flags=re.IGNORECASE)
+    if character:
+        text = re.sub(r",?\s*" + re.escape(character) + r"(,\s*seen as part of the scene)?",
+                      "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*,\s*([.,])", r"\1", text)  # 'wonder, .' -> 'wonder.'
     text = re.sub(r"\s{2,}", " ", text)
     return text.strip(" ,")
 
 
-def anchor_prompt(prompt: str, character: bool) -> str:
+def anchor_prompt(prompt: str, character: bool, character_sig: str = "") -> str:
     """Force the art direction and identity anchor onto a planner-written image prompt.
 
     The detailed planner writes prompts that share no style words between frames ('Cyberpunk art
-    style', 'Vibrant cyberpunk art') and name no raincoat or scarf, so identity has nothing to
+    style', 'Vibrant cyberpunk art') and name no costume accent, so identity has nothing to
     hold onto. Order is preserved from `Shot.prompt()`: style, scene, identity last, format last.
-    The shot's `character` flag wins over what the prompt happens to mention.
+    The shot's `character` flag wins over what the prompt happens to mention. `character_sig` is
+    the arc's own signature, so each arc anchors to its own protagonist.
     """
     text = " ".join((prompt or "").split()).strip()
     text = re.sub(r"[,.]?\s*engagement hook of [^.,]+[.,]?", "", text, flags=re.IGNORECASE)
     if not character:
-        text = _strip_signature(text)
+        text = _strip_signature(text, character_sig)
     text = " ".join(text.split()).strip()
     low = text.lower()
 
     style = "" if ("cel-shaded" in low or "lineart" in low) else STYLE.rstrip(".") + "."
     body = text.rstrip(" .") + "." if text else ""
     trail = []
-    if character and "raincoat" not in low:
-        trail.append(f"{CHARACTER}, seen as part of the scene.")
+    if character and character_sig and character_sig.lower() not in low:
+        trail.append(f"{character_sig}, seen as part of the scene.")
     if "9:16" not in text and "portrait" not in low:
         trail.append("Vertical 9:16 portrait composition.")
     if "no text" not in low:
@@ -603,7 +622,8 @@ def _map_shot_type(raw: str) -> str:
     return "medium"
 
 
-def compose_image_prompts(shots: list[Shot], image_prompts: dict[int, str]) -> list[str]:
+def compose_image_prompts(shots: list[Shot], image_prompts: dict[int, str],
+                          character: str = "") -> list[str]:
     """Build per-shot image prompts, falling back to the standard prompt builder."""
     results = []
     for s in shots:
@@ -612,7 +632,7 @@ def compose_image_prompts(shots: list[Shot], image_prompts: dict[int, str]) -> l
         elif s.image_prompt_ref and s.image_prompt_ref in image_prompts:
             results.append(image_prompts[s.image_prompt_ref])
         else:
-            results.append(s.prompt())
+            results.append(s.prompt(character))
     return results
 
 
@@ -621,8 +641,8 @@ def _prompt_for_ref(image_prompts: dict, ref: int) -> str:
     return image_prompts.get(ref) or image_prompts.get(str(ref)) or ""
 
 
-def unique_prompts(shots: list[Shot], image_prompts: dict | None = None
-                   ) -> tuple[list[str], list[int]]:
+def unique_prompts(shots: list[Shot], image_prompts: dict | None = None,
+                   character: str = "") -> tuple[list[str], list[int]]:
     """Return (prompts to render once, per-shot index into them).
 
     Shots that share an `image_prompt_ref` are rendered once and that frame is held for each of
@@ -635,7 +655,7 @@ def unique_prompts(shots: list[Shot], image_prompts: dict | None = None
     for s in shots:
         # The ref wins over the shot's own prompt: a reused ref must render as one image.
         prompt = ((_prompt_for_ref(image_prompts, s.image_prompt_ref) if s.image_prompt_ref else "")
-                  or s.image_generation_prompt or s.prompt())
+                  or s.image_generation_prompt or s.prompt(character))
         index = seen.get(prompt)
         if index is None:
             index = len(ordered)
@@ -737,9 +757,26 @@ def _declared_arc(text: str, lo: int, hi: int) -> int:
     return max(lo, min(int(match.group(1)), hi))
 
 
+def _signature_instruction(character: str) -> str:
+    """The per-arc identity instruction the detailed planner is told to follow.
+
+    With a signature it is pinned verbatim (so the anchor step has a stable string to hold on
+    to); without one it only asks for a consistent protagonist, for callers that plan ad hoc.
+    """
+    if character:
+        return (f"Any prompt that shows the protagonist must describe them with exactly this "
+                f"signature, placed last and verbatim: `{character}`. Do not paraphrase the "
+                f"signature and do not add meta-language about engagement hooks — describe only "
+                f"what is in frame.")
+    return ("Any prompt that shows a character on screen must keep one consistent protagonist "
+            "with a single short signature placed last. Do not add meta-language about "
+            "engagement hooks — describe only what is in frame.")
+
+
 def plan_shorts_detailed(
     *,
     theme: str,
+    character: str = "",
     api_key: str = "",
     want: int = 0,
     target_seconds: float = 0.0,
@@ -774,7 +811,8 @@ def plan_shorts_detailed(
         lo = hi = 1
         total_parts = max(1, min(int(total_parts), MAX_PARTS))
         part = max(1, min(int(part), total_parts))
-    system = PLAN_SYSTEM_PROMPT_DETAILED
+    system = PLAN_SYSTEM_PROMPT_DETAILED.replace("__CHARACTER_SIGNATURE__",
+                                                 _signature_instruction(character))
     user = f"Theme/story idea: {theme}"
     if want:
         system += (f"\n\n## This request\nProduce exactly {want} shots and exactly {want} numbered "
@@ -901,7 +939,7 @@ def plan_shorts_detailed(
         if s.image_prompt_ref:
             needs_character[s.image_prompt_ref] = (
                 needs_character.get(s.image_prompt_ref, False) or s.character)
-    image_prompts = {ref: anchor_prompt(p, needs_character.get(ref, False))
+    image_prompts = {ref: anchor_prompt(p, needs_character.get(ref, False), character)
                      for ref, p in image_prompts.items()}
     for s in shots:
         if s.image_prompt_ref in image_prompts:

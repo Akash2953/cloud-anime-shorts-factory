@@ -20,7 +20,7 @@ from pathlib import Path
 
 import requests
 
-from scenes import CHARACTER, STYLE, api_error_detail, is_quota_error
+from scenes import STYLE, api_error_detail, is_quota_error
 
 logger = logging.getLogger(__name__)
 
@@ -187,12 +187,15 @@ def produce_images(
     img_dir: Path,
     strategy: str = "fresh",
     character_flags: list[bool] | None = None,
+    character: str = "",
     budget: dict | None = None,
 ) -> tuple[list[Path], str]:
     """Render one image per prompt. Returns (frames, strategy_used).
 
-    `character_flags[i]` marks prompts where the girl is on screen; only those take part in the
-    canonical-frame conditioning, so inserts and establishing shots stay independent.
+    `character_flags[i]` marks prompts where the arc's protagonist is on screen; only those take
+    part in the canonical-frame conditioning, so inserts and establishing shots stay
+    independent. `character` is the arc's own identity signature, so each arc conditions on its
+    own face instead of a shared one.
     """
     if strategy not in VALID_STRATEGIES:
         logger.warning("Unknown image strategy %r, using 'fresh'", strategy)
@@ -208,8 +211,9 @@ def produce_images(
     if strategy == "sheet" and affordable():
         budget["attempts"] += 1
         n = len(prompts)
+        sig = f"{character}, " if character else ""
         sheet_prompt = (
-            f"{STYLE}. Character reference sheet: {CHARACTER}, shown {n} times in a "
+            f"{STYLE}. Character reference sheet: {sig}shown {n} times in a "
             f"3x{(n + 2) // 3} grid of equal panels with no borders, each panel a different pose, "
             "full body, identical design in every panel.")
         res = generate_fresh(sheet_prompt, cfa_token, account_id)
@@ -251,8 +255,8 @@ def produce_images(
 
             res = generate_edit(
                 canonical,
-                f"Keep the EXACT same character — identical face, hair, hood, red scarf and coat as "
-                f"the reference image. {prompt}",
+                "Keep the EXACT same character — identical face, hair and outfit as the reference "
+                f"image. {prompt}",
                 cfa_token, account_id)
             if res.ok:
                 edits += 1

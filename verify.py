@@ -19,7 +19,7 @@ from audio import SAMPLE_RATE, Narration, join_with_gaps, write_wav
 from config import load_config
 from images import KLEIN, SCHNELL, image_ext, load_frames, produce_images
 from render import render_narration
-from scenes import Shot, plan_shots, shots_for_duration
+from scenes import Shot, make_character, plan_shots, shots_for_duration
 
 BUILD = Path("build")
 FRAMES = BUILD / "frames"
@@ -99,11 +99,12 @@ def main() -> int:
         FRAMES.mkdir(parents=True, exist_ok=True)
         for stale in FRAMES.glob("frame_*.*"):
             stale.unlink()
+        character = make_character("verify")
         frames, used = produce_images(
-            [s.prompt() for s in shots],
+            [s.prompt(character) for s in shots],
             cfa_token=cfg["CFAI_TOKEN"], account_id=cfg["CF_ACCOUNT_ID"],
             img_dir=FRAMES, strategy=args.strategy,
-            character_flags=[s.character for s in shots],
+            character_flags=[s.character for s in shots], character=character,
             budget={"attempts": 0, "max": args.max_images})
         sizes = []
         for f in frames:

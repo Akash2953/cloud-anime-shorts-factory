@@ -23,8 +23,9 @@ from config import load_config, Limits
 from images import load_frames, produce_images
 from publish import exchange_refresh_token, upload_video
 from render import render_narration
-from scenes import (MAX_PARTS, Shot, plan_arc, plan_shorts_detailed, reuse_image_refs,
-                    shots_for_duration, unique_prompts, validate_story_position)
+from scenes import (MAX_PARTS, Shot, make_character, plan_arc, plan_shorts_detailed,
+                    reuse_image_refs, shots_for_duration, unique_prompts,
+                    validate_story_position)
 from state import compute_fingerprint, parse_state, save_state, today_key
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
@@ -82,7 +83,10 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None
             # Pin the arc on the first run that uses it: changing SERIES_PARTS mid-arc must not
             # make a part 2 that follows an uploaded "#1/3" call itself "#2 of 5".
             series["total_parts"] = total_parts
-            state["series"] = series
+        # An in-flight arc keeps the protagonist it opened with, even for state written before
+        # a character was pinned: a signature regenerated from the id is stable either way.
+        series.setdefault("character", make_character(series.get("id", "arc")))
+        state["series"] = series
         logger.info("Continuing series %s — part %d/%d (%d shots)",
                     series.get("id"), index + 1, total_parts, len(shots))
         return shots, index + 1, total_parts, state
@@ -91,6 +95,12 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None
                            or (cfg["MIN_SECONDS"] + cfg["MAX_SECONDS"]) // 2)
     want = int(cfg.get("SHOTS_PER_PART") or shots_for_duration(target_seconds))
     part_number = index + 1
+    # Each arc draws its own protagonist, fixed for the whole arc. A new story (index 0) gets a
+    # signature seeded from today's id; an in-flight continuation keeps the one it opened with.
+    if index == 0:
+        character = make_character(today_key())
+    else:
+        character = series.setdefault("character", make_character(series.get("id", "arc")))
     # `SERIES_PARTS=auto`: part 1 of a new story also decides how long the arc is. A series with
     # no pinned length that is already past part 1 (hand-made state) closes here instead.
     decide_arc = bool(auto and not pinned and part_number == 1 and not part)
@@ -102,8 +112,8 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None
                     part_number, total_parts, len(story_so_far))
 
     shots, image_prompts, fallback, declared_parts = plan_shorts_detailed(
-        theme=THEME, api_key=cfg.get("OPENROUTER_API_KEY", ""), want=want,
-        target_seconds=target_seconds,
+        theme=THEME, character=character, api_key=cfg.get("OPENROUTER_API_KEY", ""),
+        want=want, target_seconds=target_seconds,
         part=part_number, total_parts=None if decide_arc else total_parts,
         story_so_far=story_so_far,
         parts_range=(int(cfg.get("PARTS_MIN") or 1), int(cfg.get("PARTS_MAX") or MAX_PARTS)),
@@ -151,6 +161,7 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None
     series = {
         "id": today_key(),
         "theme": THEME,
+        "character": character,  # this arc's protagonist, so it is not shared across arcs
         "parts": [[s.as_dict() for s in shots]],
         "total_parts": total_parts,
         "next_part": 0,  # part 1 is pending until an upload actually succeeds
@@ -190,6 +201,10 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
     shots, part_num, total_parts, state = resolve_part(cfg, state, part=part)
     target_seconds = cfg.get("PREFERRED_SECONDS") or (cfg["MIN_SECONDS"] + cfg["MAX_SECONDS"]) // 2
     strategy = cfg.get("IMAGE_STRATEGY", "edit")
+    # The arc's own protagonist. For state written before a character was pinned, regenerate it
+    # deterministically from the arc id so an old run still conditions on one consistent face.
+    character = ((state.get("series") or {}).get("character")
+                 or make_character((state.get("series") or {}).get("id", "arc")))
 
     if reuse_frames:
         img_dir = Path("build/frames")
@@ -218,7 +233,7 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
             # references it, so the daily image allowance buys more shots.
             image_prompts_raw = (state.get("series") or {}).get("image_prompts", {})
             shots = reuse_image_refs(shots, int(budget["max"]))
-            final_prompts, slots = unique_prompts(shots, image_prompts_raw)
+            final_prompts, slots = unique_prompts(shots, image_prompts_raw, character)
             logger.info("Rendering %d image(s) for %d shots", len(final_prompts), len(shots))
 
             chars = [any(shot.character for shot, slot in zip(shots, slots) if slot == k)
@@ -226,7 +241,7 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
             rendered, strategy = produce_images(
                 final_prompts, cfa_token=cfg["CFAI_TOKEN"],
                 account_id=cfg["CF_ACCOUNT_ID"], img_dir=img_dir,
-                strategy=strategy, character_flags=chars, budget=budget,
+                strategy=strategy, character_flags=chars, character=character, budget=budget,
             )
             paired = [(shot, rendered[slot]) for shot, slot in zip(shots, slots)
                       if slot < len(rendered)]

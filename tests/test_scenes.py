@@ -8,10 +8,15 @@ image prompt (a leading character paragraph collapsed every frame into a portrai
 import unittest
 
 from scenes import (
-    CHARACTER, NARRATIVE_ROLES, SHOT_SIZES, STYLE, Shot, _infer_character, _template_shots,
-    anchor_prompt, fit_shot_count, parse_detailed_response, parse_plan, plan_shots,
-    _spoken_words, reuse_image_refs, shots_for_duration, unique_prompts, words_for_duration,
+    NARRATIVE_ROLES, SHOT_SIZES, STYLE, Shot, _infer_character, _template_shots,
+    anchor_prompt, fit_shot_count, make_character, parse_detailed_response, parse_plan,
+    plan_shots, _spoken_words, reuse_image_refs, shots_for_duration, unique_prompts,
+    words_for_duration,
 )
+
+# The signature is now a per-arc value, not a global. Tests pin one value so the
+# "raincoat"/"red scarf" substring assertions keep their meaning.
+CHARACTER = "a girl in a black hooded raincoat with a red scarf"
 
 SAMPLE = """PART 1
 1 | establishing | crane_down | high above a rain-soaked neon skyline | rain hammers the towers | no object | establish_context | none | Rain hammers the sleeping city and the sky glows.
@@ -56,7 +61,7 @@ class TestPromptArchitecture(unittest.TestCase):
         shot = Shot(narration="x.", shot_size="wide", place="in a flooded brick alley",
                     action="she drops into the water", story_object="puddle reflections",
                     narrative_role="build_tension", character=True, camera="tilt_down")
-        prompt = shot.prompt()
+        prompt = shot.prompt(CHARACTER)
         self.assertIn("in a flooded brick alley", prompt)
         self.assertLess(prompt.index("flooded brick alley"), prompt.index(CHARACTER))
         self.assertTrue(prompt.startswith("Anime key visual"))
@@ -65,7 +70,7 @@ class TestPromptArchitecture(unittest.TestCase):
     def test_insert_shots_carry_no_character(self):
         shot = Shot(narration="x.", shot_size="insert", place="on a hand", action="it shakes",
                     story_object="paper lantern", narrative_role="build_tension", character=False)
-        self.assertNotIn(CHARACTER, shot.prompt())
+        self.assertNotIn(CHARACTER, shot.prompt(CHARACTER))
 
 
 class TestPacing(unittest.TestCase):
@@ -230,39 +235,40 @@ class TestPromptAnchoring(unittest.TestCase):
                     "engagement hook of intrigue.")
 
     def test_character_prompt_gets_the_identity_signature(self):
-        out = anchor_prompt(self.GENERIC_CHAR, character=True)
+        out = anchor_prompt(self.GENERIC_CHAR, character=True, character_sig=CHARACTER)
         self.assertIn(CHARACTER, out)
         self.assertIn("red scarf", out)
 
     def test_environment_prompt_gets_no_face(self):
-        out = anchor_prompt(self.GENERIC_ENV, character=False)
+        out = anchor_prompt(self.GENERIC_ENV, character=False, character_sig=CHARACTER)
         self.assertNotIn("raincoat", out)
 
     def test_environment_prompt_drops_a_signature_the_planner_wrote(self):
         leaked = self.GENERIC_ENV.replace("engagement hook of mystery.",
                                           f"moody rain, {CHARACTER}.")
-        out = anchor_prompt(leaked, character=False)
+        out = anchor_prompt(leaked, character=False, character_sig=CHARACTER)
         self.assertNotIn("raincoat", out)
         self.assertIn("moody rain.", out)
         self.assertNotIn(", .", out)
 
     def test_art_direction_is_shared_across_frames(self):
-        for out in (anchor_prompt(self.GENERIC_ENV, False), anchor_prompt(self.GENERIC_CHAR, True)):
+        for out in (anchor_prompt(self.GENERIC_ENV, False, character_sig=CHARACTER),
+                    anchor_prompt(self.GENERIC_CHAR, True, character_sig=CHARACTER)):
             self.assertIn("cel-shaded", out)
             self.assertIn("lineart", out)
             self.assertIn(STYLE.split(",")[0], out)
 
     def test_identity_never_leads_the_prompt(self):
-        out = anchor_prompt(self.GENERIC_CHAR, character=True)
+        out = anchor_prompt(self.GENERIC_CHAR, character=True, character_sig=CHARACTER)
         self.assertLess(out.index("rooftop"), out.index("raincoat"))
 
     def test_meta_language_is_stripped(self):
-        out = anchor_prompt(self.GENERIC_ENV, character=False)
+        out = anchor_prompt(self.GENERIC_ENV, character=False, character_sig=CHARACTER)
         self.assertNotIn("engagement hook", out)
 
     def test_anchor_is_idempotent(self):
-        once = anchor_prompt(self.GENERIC_CHAR, character=True)
-        self.assertEqual(anchor_prompt(once, character=True), once)
+        once = anchor_prompt(self.GENERIC_CHAR, character=True, character_sig=CHARACTER)
+        self.assertEqual(anchor_prompt(once, character=True, character_sig=CHARACTER), once)
 
     def test_planner_output_is_anchored_end_to_end(self):
         from unittest.mock import patch
@@ -277,7 +283,8 @@ class TestPromptAnchoring(unittest.TestCase):
                  "Image 1: Cyberpunk art style, rainy skyline, emotional beat of awe.\n"
                  "Image 2: Anime style, hooded girl on a rooftop, cool lighting.\n")
         with patch("scenes._openrouter", return_value=reply):
-            shots, prompts, fallback, _arc = plan_shorts_detailed(theme="lantern city", api_key="k")
+            shots, prompts, fallback, _arc = plan_shorts_detailed(theme="lantern city",
+                                                                  character=CHARACTER, api_key="k")
         self.assertFalse(fallback)
         self.assertIn("raincoat", prompts[2])
         self.assertNotIn("raincoat", prompts[1])

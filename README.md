@@ -42,9 +42,11 @@ frame into the same portrait (measured: 7 medium portraits vs. 13 varied shots).
 
 ### Character consistency (why the pictures hold together)
 
-1. **Art direction first.** Identity never depends on the face: hooded black raincoat, red scarf,
-   dark bob, paper lantern. Most cuts are places, objects and backs, and `scenes.Shot.prompt()`
-   names the story object explicitly.
+1. **Art direction first.** Identity never depends on the face: each arc gets its own short
+   signature from `scenes.make_character(series_id)` (a costume accent, not a face), pinned in
+   `state.json` under `series.character` so the whole arc stays consistent while different arcs
+   draw different protagonists. Most cuts are places, objects and backs, and
+   `scenes.Shot.prompt()` names the story object explicitly.
 2. **`edit` strategy.** The first *character* shot is rendered fresh by `flux-1-schnell` and
    becomes canonical. Later character shots are **edits** of that same frame by `flux-2-klein`
    with a style+identity anchor. Edits never chain off the previous edit, and environment shots
