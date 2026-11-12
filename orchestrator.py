@@ -34,10 +34,7 @@ logger = logging.getLogger(__name__)
 BEAT_GAP = 0.35      # breath between narration lines
 TAIL_HOLD = 0.6      # last frame held after the voice stops
 MIN_CUT = 0.8        # shortest a still may be held, so a silent beat cannot flash past
-THEME = (
-    "cyberpunk anime, floating paper lanterns over a rain-soaked city, "
-    "a hooded girl searching for her missing brother"
-)
+
 
 
 def load_state(path: Path) -> dict:
@@ -51,45 +48,49 @@ def advance_series(state: dict, uploaded_part: int) -> None:
         series["next_part"] = max(int(series.get("next_part", 0)), uploaded_part)
 
 
-def resolve_part(cfg: dict, state: dict, *, part: int | None = None
-                 ) -> tuple[list[Shot], int, int, dict]:
+def resolve_part(cfg: dict, state: dict, *, part: int | None = None,
+                 plan_only: bool = False) -> tuple[list[Shot], int, int, dict]:
     """Return (shots, part_number, total_parts, state). Creates or extends the series as needed.
 
     `part` asks for one specific part without consulting (or advancing) the publish queue — that
     is how a later part gets planned and previewed while an earlier one is still unpublished.
     """
-    series = state.get("series") or {}
-    parts = series.get("parts") or []
-    index = (int(part) - 1) if part else int(series.get("next_part", 0))
-    requested = cfg.get("SERIES_PARTS") or 1
-    auto = isinstance(requested, str) and requested.lower() == "auto"
-    pinned = int(series.get("total_parts") or 0)  # an arc in flight keeps the length it began with
-    total_parts = pinned or (1 if auto else int(requested))
-    if part and index > len(parts):
-        raise RuntimeError(f"part {part} needs parts 1..{index} planned first "
-                           f"(only {len(parts)} stored)")
-    if part and index < total_parts:
-        total_parts = max(total_parts, index + 1)
-    elif parts and index >= total_parts:
-        logger.info("Series %s complete (%d/%d parts uploaded); starting a new story",
-                    series.get("id"), len(parts), total_parts)
-        parts, index = [], 0
-        pinned = 0
-        total_parts = 1 if auto else int(requested)
+    # plan-only mode ignores the existing series so every call spins up a fresh story.
+    if plan_only:
+        parts, index, pinned, total_parts, auto = [], 0, 0, 1, False
+    else:
+        series = state.get("series") or {}
+        parts = series.get("parts") or []
+        index = (int(part) - 1) if part else int(series.get("next_part", 0))
+        requested = cfg.get("SERIES_PARTS") or 1
+        auto = isinstance(requested, str) and requested.lower() == "auto"
+        pinned = int(series.get("total_parts") or 0)  # an arc in flight keeps the length it began with
+        total_parts = pinned or (1 if auto else int(requested))
+        if part and index > len(parts):
+            raise RuntimeError(f"part {part} needs parts 1..{index} planned first "
+                               f"(only {len(parts)} stored)")
+        if part and index < total_parts:
+            total_parts = max(total_parts, index + 1)
+        elif parts and index >= total_parts:
+            logger.info("Series %s complete (%d/%d parts uploaded); starting a new story",
+                        series.get("id"), len(parts), total_parts)
+            parts, index = [], 0
+            pinned = 0
+            total_parts = 1 if auto else int(requested)
 
-    if parts and index < len(parts):
-        shots = [Shot.from_dict(d) for d in parts[index]]
-        if series.get("total_parts") != total_parts:
-            # Pin the arc on the first run that uses it: changing SERIES_PARTS mid-arc must not
-            # make a part 2 that follows an uploaded "#1/3" call itself "#2 of 5".
-            series["total_parts"] = total_parts
-        # An in-flight arc keeps the protagonist it opened with, even for state written before
-        # a character was pinned: a signature regenerated from the id is stable either way.
-        series.setdefault("character", make_character(series.get("id", "arc")))
-        state["series"] = series
-        logger.info("Continuing series %s — part %d/%d (%d shots)",
-                    series.get("id"), index + 1, total_parts, len(shots))
-        return shots, index + 1, total_parts, state
+        if parts and index < len(parts):
+            shots = [Shot.from_dict(d) for d in parts[index]]
+            if series.get("total_parts") != total_parts:
+                # Pin the arc on the first run that uses it: changing SERIES_PARTS mid-arc must not
+                # make a part 2 that follows an uploaded "#1/3" call itself "#2 of 5".
+                series["total_parts"] = total_parts
+            # An in-flight arc keeps the protagonist it opened with, even for state written before
+            # a character was pinned: a signature regenerated from the id is stable either way.
+            series.setdefault("character", make_character(series.get("id", "arc")))
+            state["series"] = series
+            logger.info("Continuing series %s — part %d/%d (%d shots)",
+                        series.get("id"), index + 1, total_parts, len(shots))
+            return shots, index + 1, total_parts, state
 
     target_seconds = float(cfg.get("PREFERRED_SECONDS")
                            or (cfg["MIN_SECONDS"] + cfg["MAX_SECONDS"]) // 2)
@@ -112,7 +113,7 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None
                     part_number, total_parts, len(story_so_far))
 
     shots, image_prompts, fallback, declared_parts = plan_shorts_detailed(
-        theme=THEME, character=character, api_key=cfg.get("OPENROUTER_API_KEY", ""),
+        theme="", character=character, api_key=cfg.get("OPENROUTER_API_KEY", ""),
         want=want, target_seconds=target_seconds,
         part=part_number, total_parts=None if decide_arc else total_parts,
         story_so_far=story_so_far,
@@ -124,7 +125,7 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None
         logger.info("Arc length for this story: %d part(s)", total_parts)
     if not shots:
         arc, fallback = plan_arc(
-            theme=THEME, parts=1, per_part=want, api_key=cfg.get("OPENROUTER_API_KEY", ""),
+            theme="", parts=1, per_part=want, api_key=cfg.get("OPENROUTER_API_KEY", ""),
         )
         shots = arc[0] if arc else []
         image_prompts = {}
@@ -160,7 +161,7 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None
 
     series = {
         "id": today_key(),
-        "theme": THEME,
+        "theme": "",
         "character": character,  # this arc's protagonist, so it is not shared across arcs
         "parts": [[s.as_dict() for s in shots]],
         "total_parts": total_parts,
@@ -194,11 +195,16 @@ def beat_track(shots: list[Shot], spoken_segments: list[np.ndarray], *,
 
 
 def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
-                 reuse_frames: bool = False, part: int | None = None) -> None:
+                 reuse_frames: bool = False, plan_only: bool = False, part: int | None = None) -> None:
     cfg = load_config()
     state = load_state(Path("state.json"))
     fps = 24
-    shots, part_num, total_parts, state = resolve_part(cfg, state, part=part)
+    shots, part_num, total_parts, state = resolve_part(cfg, state, part=part, plan_only=plan_only)
+    if plan_only:
+        Path("state.json").write_text(save_state(state), encoding="utf-8")
+        logger.info("Plan-only: wrote %d shot(s), part %d/%d — stopping before images/render/upload",
+                    len(shots), part_num, total_parts)
+        return
     target_seconds = cfg.get("PREFERRED_SECONDS") or (cfg["MIN_SECONDS"] + cfg["MAX_SECONDS"]) // 2
     strategy = cfg.get("IMAGE_STRATEGY", "edit")
     # The arc's own protagonist. For state written before a character was pinned, regenerate it
@@ -349,6 +355,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Cloud Anime Shorts Factory pipeline")
     parser.add_argument("--render-only", action="store_true",
                         help="stop after rendering and skip upload")
+    parser.add_argument("--plan-only", action="store_true",
+                        help="generate a fresh story only; write state and exit before images/render/upload")
     parser.add_argument("--offline-images", action="store_true",
                         help="generate placeholder frames (no API key required)")
     parser.add_argument("--reuse-frames", action="store_true",
@@ -357,4 +365,4 @@ if __name__ == "__main__":
                         help="plan/preview part N of the arc without touching the publish queue")
     args = parser.parse_args()
     run_pipeline(render_only=args.render_only, offline_images=args.offline_images,
-                 reuse_frames=args.reuse_frames, part=args.part)
+                 reuse_frames=args.reuse_frames, plan_only=args.plan_only, part=args.part)

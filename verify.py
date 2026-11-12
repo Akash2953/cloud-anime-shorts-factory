@@ -77,8 +77,7 @@ def main() -> int:
 
     # 1. Scene plan -----------------------------------------------------------
     shots, fallback = plan_shots(
-        theme="cyberpunk anime, floating paper lanterns over a rain-soaked city, "
-              "a hooded girl searching for her missing brother",
+        theme="",
         count=count,
         api_key=cfg["OPENROUTER_API_KEY"])
     roles = {s.narrative_role for s in shots}
