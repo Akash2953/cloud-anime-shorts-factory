@@ -7,11 +7,13 @@ Zero-cost cloud pipeline that autonomously generates and publishes one anime-sty
 ```
 GitHub Actions (cron 12:00 UTC) — one upload per day
     └── Python Orchestrator
-         ├── Scene plan     OpenRouter free models → local template (never Workers AI)
+         ├── Scene plan     Antigravity OAuth → OpenRouter free models → local template
+         │                  (Workers AI stays reserved for images)
          │                  shot list: size/camera/place/action/object/role/character/narration
          │                  1 part per short, or up to 7 parts queued across days
-         ├── Images         strategy `edit`: first character shot = canon, later character
-         │                  shots = edits of it; env/insert shots render fresh
+         ├── Images         Antigravity OAuth first, Workers AI on any refusal; strategy `edit`:
+         │                  first character shot = canon,
+         │                  later character shots = edits of it; env/insert shots render fresh
          │                  fallbacks: `sheet` (one sheet, cropped) → `fresh` (unlocked)
          ├── Narration      Kokoro-82M TTS (local ONNX), voice af_heart
          ├── Render         each still held for its own line, Ken Burns, 1080x1920, AAC
@@ -47,10 +49,11 @@ frame into the same portrait (measured: 7 medium portraits vs. 13 varied shots).
    `state.json` under `series.character` so the whole arc stays consistent while different arcs
    draw different protagonists. Most cuts are places, objects and backs, and
    `scenes.Shot.prompt()` names the story object explicitly.
-2. **`edit` strategy.** The first *character* shot is rendered fresh by `flux-1-schnell` and
-   becomes canonical. Later character shots are **edits** of that same frame by `flux-2-klein`
-   with a style+identity anchor. Edits never chain off the previous edit, and environment shots
-   stay independent, so drift cannot accumulate.
+2. **`edit` strategy.** The first *character* shot is rendered fresh (Antigravity, or `flux-1-schnell`
+   on the Workers AI fallback) and becomes canonical. Later character shots are **edits** of that
+   same frame — Antigravity image editing, or `flux-2-klein` when Antigravity refuses — with a style+identity
+   anchor. Edits never chain off the previous edit, and environment shots stay independent, so
+   drift cannot accumulate.
 3. **`sheet` fallback.** If the edit model is unavailable (paid-plan gating, quota, outage), the
    run renders one character sheet and crops per-beat panels — identity is literally identical
    pixels. Chosen automatically, and recorded in `state.json` under `daily.strategy`.
@@ -62,6 +65,26 @@ frame into the same portrait (measured: 7 medium portraits vs. 13 varied shots).
 Narration is synthesised at **natural pace** (speed 1.0). Speed is only adjusted when the total
 falls outside `MIN_SECONDS`–`MAX_SECONDS` (default 45–75 s), so an 8-beat story typically lands
 ~50–60 s without the drawl of a forced 55 s. Tune with `MIN_SECONDS` / `MAX_SECONDS`.
+
+### Subtitles
+
+Word-synced captions need **faster-whisper and Pillow in the same interpreter that runs the
+pipeline**. Both are in `requirements.txt`; the GitHub runner installs them, but a local run under
+a different Python will not have them:
+
+```bash
+python -c "from captions import missing_caption_dependencies; print(missing_caption_dependencies())"
+# [] = word-synced captions; ['faster_whisper'] = one caption per beat; ['PIL'] = no captions
+```
+
+Degradation is deliberate and announced at startup (`caption_preflight`), because a silent one
+once published a short with no subtitles at all:
+
+| Missing | Result |
+|---|---|
+| nothing | word-synced 1–3 word groups (faster-whisper alignment) |
+| `faster_whisper` | **line-level captions** — one strip per beat, timed to the beat holds (`WARNING` at startup) |
+| `PIL` | no captions can be rendered (`ERROR` at startup, before image quota is spent) |
 
 ### Multi-part stories
 
@@ -87,12 +110,34 @@ each shot (`image_generation_prompt`) rather than in a part-indexed dict, so par
 part 1's prompt. A local-template fallback story is never persisted, so a degraded day cannot
 lock placeholder text into the series.
 
+### Provider priority
+
+**Antigravity OAuth is first** for story planning and image generation when configured. It can use
+a manually supplied access token, or refresh access tokens automatically from a refresh token.
+Both methods require `ANTIGRAVITY_PROJECT_ID`. Gemini API keys are not used by the pipeline.
+An Antigravity refusal (model unavailable, quota, safety block, timeout) falls through to the
+next provider:
+
+| Job | 1st | 2nd | 3rd |
+|---|---|---|---|
+| Story text | Antigravity OAuth (`gemini.py`) | OpenRouter free models | local template |
+| Images | Antigravity OAuth | Workers AI `flux-1-schnell` / `flux-2-klein` | — |
+
+Antigravity model names are overridable (`ANTIGRAVITY_TEXT_MODEL`,
+`ANTIGRAVITY_IMAGE_MODEL`). An Antigravity `429` falls back to OpenRouter for story text or
+Workers AI for images. Antigravity image requests specify a `9:16` aspect ratio, and returned
+images are center-cropped to that exact ratio before use. `images.fresh_image` / `images.edit_image`
+choose the image provider, so the strategy engine (`edit` / `sheet` / `fresh`) behaves identically
+on either provider.
+
 ### Zero-spend policy
 - No provider assumed to offer a permanent free quota.
 - Router rejects providers that require payment.
+- Antigravity is first priority but never assumed available: an expired OAuth token costs one
+  failed request, then the free Workers AI path renders the image.
 - Story planning never touches Workers AI: its daily neurons belong to image generation, so
-  planning goes OpenRouter → local template (`plan_shots`/`plan_arc`/`plan_shorts_detailed`
-  accept no Cloudflare credentials at all).
+  planning goes Antigravity → OpenRouter → local template (`plan_shots`/`plan_arc`/
+  `plan_shorts_detailed` accept no Cloudflare credentials at all).
 - Stops on free-limit exhaustion (fail-closed): `4006` / `429` from Workers AI aborts image
   generation immediately instead of retrying, and the run exits without uploading or advancing
   the queue. The error code is logged, so "quota spent" is never mistaken for "rate limited".
@@ -112,7 +157,8 @@ reset at 00:00 UTC). Images are 1024×1024, i.e. 4 tiles of 512×512:
 So a 13-shot short costs **~750 neurons** (`fresh`, 13 images) or **~1,450 neurons** (`edit`:
 1 canonical + 10 edits + 2 environment renders) — about **7–13 shorts per day** inside the free
 allowance. The real ceilings are one upload/day and OpenRouter's 50 free planner requests/day
-(1–2 per short), not the neuron budget. Keep `IMAGE_STRATEGY=sheet` for the case that *is* tight:
+(1–2 per short), not the neuron budget. With Antigravity OAuth configured these numbers are the
+*fallback* budget: neurons are only spent on days Antigravity refuses. Keep `IMAGE_STRATEGY=sheet` for the case that *is* tight:
 the planner's free models are down, or a run has to be re-rendered several times in one day.
 
 ### Local models
@@ -130,7 +176,9 @@ Available voices in the bundle: `af_heart` (default), `af_bella`, `af_sky`, `am_
 ## Prerequisites
 
 - GitHub repo with secrets configured
-- Cloudflare account (Workers AI)
+- Antigravity OAuth credentials and its Google project ID (optional; the free fallbacks below work
+  without them)
+- Cloudflare account (Workers AI image fallback)
 - Google Cloud project (YouTube API OAuth credentials)
 - FFmpeg installed on renderer runner (provided in GitHub Actions)
 
@@ -186,14 +234,34 @@ first scheduled run.
 
 | Secret | Purpose |
 |--------|---------|
-| `CFAI_TOKEN` | Cloudflare AI API token |
+| `ANTIGRAVITY_REFRESH_TOKEN` | Optional first-priority provider for story text and images; access tokens refresh automatically |
+| `ANTIGRAVITY_OAUTH_CLIENT_ID` / `ANTIGRAVITY_OAUTH_CLIENT_SECRET` | OAuth client credentials used by the local sign-in and token refresh; secret is optional for desktop clients |
+| `ANTIGRAVITY_ACCESS_TOKEN` | Optional short-lived token for manual/local use; it does not refresh automatically |
+| `ANTIGRAVITY_PROJECT_ID` | Required with Antigravity; set as a GitHub Actions variable |
+| `CFAI_TOKEN` | Cloudflare AI API token (image fallback) |
 | `CF_ACCOUNT_ID` | Cloudflare account ID (for Workers AI; falls back to `R2_ACCOUNT_ID`) |
 | `YOUTUBE_CLIENT_ID` / `CLIENT_SECRET` / `REFRESH_TOKEN` | YouTube OAuth |
-| `OPENROUTER_API_KEY` | Story planning — the only text provider used |
+| `OPENROUTER_API_KEY` | Story planning fallback when Antigravity refuses |
 | `KOKORO_VOICE` | Optional — narration voice (default `af_heart`) |
 
 Local `.env` (gitignored) is read by `config.load_config()`; the same names work as GitHub
-Actions secrets.
+Actions secrets or variables. The Antigravity token is sent only in the Authorization header and
+is never printed by `verify.py`.
+
+### Antigravity OAuth sign-in
+
+Set `ANTIGRAVITY_OAUTH_CLIENT_ID` (and, if your OAuth client requires it,
+`ANTIGRAVITY_OAUTH_CLIENT_SECRET`) in `.env`, then run:
+
+```bash
+python tools/antigravity_auth.py
+```
+
+Approve access in the browser. The helper uses a loopback callback and PKCE, discovers the
+Antigravity project when available, and saves the refresh token and project ID to the ignored
+`.env` file without printing token values. For GitHub Actions, copy `ANTIGRAVITY_REFRESH_TOKEN`
+and the OAuth client values into repository Secrets, and set `ANTIGRAVITY_PROJECT_ID` as a
+repository Variable. Do not put an access token in Actions; it expires and cannot refresh itself.
 
 ## Run locally
 
@@ -206,15 +274,19 @@ python orchestrator.py --render-only   # stop before upload
 python orchestrator.py                 # full run
 ```
 
-Useful flags: `--offline-images` (test-pattern frames, no quota), `--reuse-frames`
-(re-render `build/frames/`, no quota), `--no-audio` (silent cut for debugging),
-`--strategy edit|sheet|fresh` (pin the image strategy for one run).
+Useful flags: `--render-only` (stop before upload), `--plan-only` (story plan only),
+`--reuse-frames` (re-render `build/frames/`, no image quota), `--part N` (plan/preview part N
+of the arc without advancing the publish queue). Image strategy is set with `IMAGE_STRATEGY`.
 
 Environment knobs: `IMAGE_STRATEGY`, `MIN_SECONDS`, `MAX_SECONDS`, `SERIES_PARTS` (`1..7` or
 `auto`), `PARTS_MIN`, `PARTS_MAX`, `SHOTS_PER_PART`, `PREFERRED_SECONDS`, `KOKORO_VOICE`,
-`MAX_IMAGE_ATTEMPTS`, `OPENROUTER_MODELS`.
+`MAX_IMAGE_ATTEMPTS`, `ANTIGRAVITY_REFRESH_TOKEN`, `ANTIGRAVITY_OAUTH_CLIENT_ID`,
+`ANTIGRAVITY_OAUTH_CLIENT_SECRET`,
+`ANTIGRAVITY_ACCESS_TOKEN`, `ANTIGRAVITY_PROJECT_ID`, `ANTIGRAVITY_TEXT_MODEL`,
+`ANTIGRAVITY_IMAGE_MODEL`, `OPENROUTER_MODELS`.
 
-> **Story fallback ordering.** OpenRouter (`OPENROUTER_MODELS`, comma separated; defaults walk
+> **Story fallback ordering.** Antigravity OAuth (`ANTIGRAVITY_TEXT_MODEL`, default
+> `gemini-3-flash`) → OpenRouter (`OPENROUTER_MODELS`, comma separated; defaults walk
 > nemotron-3-ultra → north-mini-code → gemma-4-26b → `openrouter/free`) → local template.
 > Free reasoning models can spend the entire completion budget thinking and return `content: null`
 > (measured: `reasoning_tokens: 2169` of 1999, content empty), so planning runs with
@@ -230,6 +302,11 @@ python verify.py                  # beats -> images -> Kokoro -> render, asserts
 python verify.py --skip-images    # reuse cached frames, spends no image quota
 python verify.py --strategy sheet # check the fallback strategy specifically
 ```
+
+The header prints which providers are configured (presence only), including the selected
+Antigravity text/image models and the image fallback chain
+`Antigravity -> flux-1-schnell + flux-2-klein`. Antigravity defaults to `gemini-3-flash` for text
+and `gemini-3.1-flash-image` for images.
 
 ## Run tests
 

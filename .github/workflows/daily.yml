@@ -63,6 +63,14 @@ jobs:
 
       - name: Run Orchestrator Pipeline (narrated short + YouTube upload)
         env:
+          # First-priority provider for story text and images; failures fall back to
+          # OpenRouter / Workers AI.
+          ANTIGRAVITY_REFRESH_TOKEN: ${{ secrets.ANTIGRAVITY_REFRESH_TOKEN }}
+          ANTIGRAVITY_OAUTH_CLIENT_ID: ${{ secrets.ANTIGRAVITY_OAUTH_CLIENT_ID }}
+          ANTIGRAVITY_OAUTH_CLIENT_SECRET: ${{ secrets.ANTIGRAVITY_OAUTH_CLIENT_SECRET }}
+          ANTIGRAVITY_PROJECT_ID: ${{ vars.ANTIGRAVITY_PROJECT_ID }}
+          ANTIGRAVITY_TEXT_MODEL: ${{ vars.ANTIGRAVITY_TEXT_MODEL || 'gemini-3-flash' }}
+          ANTIGRAVITY_IMAGE_MODEL: ${{ vars.ANTIGRAVITY_IMAGE_MODEL || 'gemini-3.1-flash-image' }}
           CFAI_TOKEN: ${{ secrets.CFAI_TOKEN }}
           CF_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID || secrets.R2_ACCOUNT_ID }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
@@ -88,6 +96,9 @@ jobs:
           # stands in so the ducking and loudness stages still run.
           MUSIC_ENABLED: ${{ vars.MUSIC_ENABLED || 'true' }}
           MUSIC_DIR: ${{ vars.MUSIC_DIR || 'assets/music' }}
+          # Delete frames/captions/audio/MP4 after a successful upload. The runner is destroyed
+          # anyway, but keeping the knob explicit means a self-hosted runner behaves the same.
+          CLEANUP_AFTER_UPLOAD: ${{ vars.CLEANUP_AFTER_UPLOAD || 'true' }}
           # 'auto' = the planner chooses each story's arc length (PARTS_MIN..PARTS_MAX)
           SERIES_PARTS: ${{ vars.SERIES_PARTS || '1' }}
           PARTS_MIN: ${{ vars.PARTS_MIN || '1' }}

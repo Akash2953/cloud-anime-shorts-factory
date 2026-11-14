@@ -33,6 +33,34 @@ VOICE_URL = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/
 # English voices that suit narration. Style matrices are 510x1x256 float32.
 DEFAULT_VOICES: tuple[str, ...] = ("af_heart", "am_michael", "af_bella", "am_fenrir")
 
+# A line counts as voiced only if it has some length and some signal. Kokoro occasionally hands
+# back an empty array, or a whisper of DC offset, for a line it failed to voice — and a beat with
+# no narration is a hole in the story rather than a cosmetic defect, so it is retried and then
+# refused instead of rendered.
+MIN_LINE_SECONDS = 0.15
+MIN_LINE_PEAK = 1e-3
+LINE_ATTEMPTS = 3
+LINE_BACKOFF_S = 0.5
+
+
+class AudioLineError(RuntimeError):
+    """A narration line could not be synthesised, or came back empty or silent."""
+
+
+def _line_problem(audio: np.ndarray | None) -> str | None:
+    """Why `audio` is not a usable narration line, or None when it is."""
+    if audio is None:
+        return "no audio returned"
+    if audio.size == 0:
+        return "empty audio"
+    seconds = audio.size / SAMPLE_RATE
+    if seconds < MIN_LINE_SECONDS:
+        return f"only {seconds:.2f}s of audio"
+    peak = float(np.abs(audio).max())
+    if not np.isfinite(peak) or peak < MIN_LINE_PEAK:
+        return "audio is silent"
+    return None
+
 
 def _download(url: str, dest: Path, *, retries: int = 4) -> None:
     for attempt in range(1, retries + 1):
@@ -105,6 +133,44 @@ class Narration:
             raise RuntimeError(f"unexpected sample rate {sr}")
         return np.asarray(audio, dtype=np.float32)
 
+    def line(
+        self,
+        text: str,
+        *,
+        label: str = "",
+        voice: str | None = None,
+        speed: float | None = None,
+        attempts: int = LINE_ATTEMPTS,
+        backoff_s: float | None = None,
+    ) -> np.ndarray:
+        """Synthesise one line, retrying, and refuse to return silence.
+
+        Raises `AudioLineError` when the line still has no usable audio after `attempts` tries.
+        Callers abort the run instead of rendering a beat whose narration is missing: a hole in
+        the voice track cannot be repaired later, so the part stays queued and is retried.
+        """
+        backoff_s = LINE_BACKOFF_S if backoff_s is None else backoff_s
+        what = label or f"{text[:48]!r}"
+        last = ""
+        for attempt in range(1, attempts + 1):
+            try:
+                audio: np.ndarray | None = self.wav(text, speed=speed, voice=voice)
+            except Exception as exc:  # noqa: BLE001 — kokoro raises a variety of errors
+                audio, last = None, str(exc) or exc.__class__.__name__
+            if audio is not None:
+                problem = _line_problem(audio)
+                if problem is None:
+                    if attempt > 1:
+                        logger.info("%s: synthesised on attempt %d/%d", what, attempt, attempts)
+                    return audio
+                last = problem
+            if attempt < attempts:
+                logger.warning("%s: attempt %d/%d failed (%s); retrying",
+                               what, attempt, attempts, last)
+                if backoff_s:
+                    time.sleep(backoff_s * attempt)
+        raise AudioLineError(f"{what}: no usable audio after {attempts} attempts ({last})")
+
     def synth_scaled(
         self, lines: list[str], target_seconds: float, *, iterations: int = 4, tol: float = 0.02
     ) -> tuple[list[np.ndarray], float]:
@@ -114,7 +180,7 @@ class Narration:
         duration non-monotone in `speed`. Bisection on a monotone-decreasing assumption
         converges in a few passes and keeps the best candidate seen.
         """
-        segments = [self.wav(line) for line in lines]
+        segments = [self.line(line, label=f"line {i}") for i, line in enumerate(lines, 1)]
         speed = self.speed
         if target_seconds <= 0 or not segments:
             return segments, speed
@@ -134,7 +200,8 @@ class Narration:
 
         for attempt in range(1, iterations + 1):
             speed = round((lo + hi) / 2, 3)
-            candidate = [self.wav(line, speed=speed) for line in lines]
+            candidate = [self.line(line, speed=speed, label=f"line {i}")
+                         for i, line in enumerate(lines, 1)]
             measured = sum(len(a) for a in candidate) / SAMPLE_RATE
             error = abs(measured - target_seconds)
             logger.info("Pass %d: %.2fs at speed %.3f (error %.1f%%)",

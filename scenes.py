@@ -34,6 +34,8 @@ from typing import Optional
 
 import requests
 
+import gemini
+
 logger = logging.getLogger(__name__)
 
 MAX_PARTS = 7
@@ -199,7 +201,10 @@ Then list every image prompt, one per line, numbered sequentially (Image 1:, Ima
 frame has to keep rewarding that attention. Each prompt must be fully self-contained and contain,
 in this order: (1) art style, (2) setting, time, lighting and mood, (3) composition as a vertical
 9:16 portrait, (4) emotional beat, (5) one or two concrete physical details that sell the place
-(weather on a surface, wear on an object, what the light is landing on).
+(weather on a surface, wear on an object, what the light is landing on). The composition is ONE
+continuous single frame: never a split, diptych, panel, collage or side-by-side layout, and never
+two scenes in one image — the renderer holds this frame for six seconds and a split reads as a
+glitch, not a moment.
 __CHARACTER_SIGNATURE__
 
 Keep each field concise and concrete so the output can be extracted programmatically.
@@ -387,6 +392,7 @@ def plan_shots(
     theme: str,
     count: int,
     api_key: str = "",
+    gemini_key: str = "",
 ) -> tuple[list[Shot], bool]:
     """Return (shots, used_fallback). Text planning takes no Workers AI credentials."""
     system = PLAN_SYSTEM_PROMPT.format(
@@ -397,7 +403,7 @@ def plan_shots(
         {"role": "user", "content": f"Write the {count} shots for this story: {theme}"},
     ]
 
-    text = _plan_request(messages, api_key)
+    text = _plan_request(messages, api_key, gemini_key=gemini_key)
     shots = parse_plan(text, count) if text else []
     if len(shots) >= 6:
         logger.info("Scene plan: %d shots (%d without the character)",
@@ -408,11 +414,13 @@ def plan_shots(
     return _template_shots(count), True
 
 
-def plan_arc(*, theme: str, parts: int, per_part: int, api_key: str = ""
+def plan_arc(*, theme: str, parts: int, per_part: int, api_key: str = "",
+             gemini_key: str = ""
              ) -> tuple[list[list[Shot]], bool]:
     parts = max(1, min(parts, MAX_PARTS))
     if parts == 1:
-        shots, fallback = plan_shots(theme=theme, count=per_part, api_key=api_key)
+        shots, fallback = plan_shots(theme=theme, count=per_part, api_key=api_key,
+                                     gemini_key=gemini_key)
         return [shots], fallback
 
     head = PLAN_SYSTEM_PROMPT.format(
@@ -423,13 +431,116 @@ def plan_arc(*, theme: str, parts: int, per_part: int, api_key: str = ""
                                       f"each part's shots. Keep the story continuous across parts."},
         {"role": "user", "content": f"Write PART 1 through PART {parts} for: {theme}"},
     ]
-    text = _plan_request(messages, api_key)
+    text = _plan_request(messages, api_key, gemini_key=gemini_key)
     if text:
         parsed = _split_parts(text, parts, per_part)
         if parsed and all(len(p) >= 4 for p in parsed):
             return parsed, False
-    shots, fallback = plan_shots(theme=theme, count=per_part, api_key=api_key)
+    shots, fallback = plan_shots(theme=theme, count=per_part, api_key=api_key,
+                                 gemini_key=gemini_key)
     return [shots], fallback
+
+
+# Every field the prompt contract asks for in a shot block. Completeness is checked against the
+# raw reply, not the parsed Shot: the parser substitutes a default for anything missing (`Place`
+# becomes a shortened visual description, `Action` becomes "she watches", a character-less block is
+# dropped), so a fabricated field is indistinguishable from a written one after parsing.
+_SHOT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Duration", ("- duration:",)),
+    ("Shot type", ("- shot type:",)),
+    ("Character on screen", ("- character on screen:", "- character:")),
+    ("Camera movement", ("- camera movement:", "- camera:")),
+    ("Place", ("- place:", "- location:")),
+    ("Story object", ("- story object:",)),
+    ("Narrative role", ("- narrative role:", "- narrative beat:")),
+    ("Visual description", ("- visual description:", "- visual:")),
+    ("Action", ("- action:",)),
+    ("Narration", ("- narration:",)),
+    ("Image prompt ref", ("- image prompt ref:",)),
+)
+
+PLAN_REPAIR_ROUNDS = 2
+
+
+def _shot_blocks(text: str) -> list[str]:
+    """Raw text of each `Shot N:` block, tolerating markdown decoration around the label."""
+    parts = re.split(r"(?im)^\s*(?:#+\s*)?\*{0,2}\s*Shot\s+\d+\s*:\*{0,2}", text or "")
+    return [part.strip() for part in parts[1:] if part.strip()]
+
+
+def _ranges(numbers: list[int]) -> str:
+    """`[1, 2, 3, 5]` -> `"1-3, 5"` for a readable repair instruction."""
+    out: list[str] = []
+    start = prev = None
+    for n in numbers:
+        if start is None:
+            start = prev = n
+        elif n == prev + 1:
+            prev = n
+        else:
+            out.append(f"{start}-{prev}" if prev != start else str(start))
+            start = prev = n
+    if start is not None:
+        out.append(f"{start}-{prev}" if prev != start else str(start))
+    return ", ".join(out)
+
+
+def _plan_gaps(text: str, shots: list[Shot], image_prompts: dict[int, str], *,
+               want: int = 0, need_arc: bool = False) -> list[str]:
+    """What the planner left out of its reply, phrased as repair instructions.
+
+    Anything listed here is detail the pipeline would otherwise silently invent its own answer
+    for — a missing image prompt, a missing field per shot, an undeclared arc length, or narration
+    written as captions instead of prose.
+    """
+    gaps: list[str] = []
+    blocks = _shot_blocks(text)
+    if not shots:
+        gaps.append("no `Shot N:` blocks were written")
+        return gaps
+    if want and len(shots) < want - 2:
+        gaps.append(f"only {len(shots)} shots were written; the pacing needs {want}")
+    if len(blocks) > len(shots):
+        gaps.append(f"{len(blocks) - len(shots)} shot block(s) had neither a Narration line nor an "
+                    "image ref, so they were dropped: every shot needs both")
+    for name, labels in _SHOT_FIELDS:
+        missing = [i for i, block in enumerate(blocks, 1)
+                   if not any(label in block.lower() for label in labels)]
+        if missing:
+            gaps.append(f"shot(s) {_ranges(missing)} are missing the `{name}` field")
+    if not image_prompts:
+        gaps.append("the `--- IMAGE GENERATION PROMPTS ---` section is missing")
+    else:
+        refs = sorted({shot.image_prompt_ref for shot in shots if shot.image_prompt_ref})
+        missing = [ref for ref in refs if ref not in image_prompts]
+        if missing:
+            gaps.append(f"no image generation prompt for Image {_ranges(missing)}")
+        split = sorted(ref for ref, prompt in image_prompts.items()
+                       if _asks_for_split(prompt))
+        if split:
+            gaps.append(f"Image {_ranges(split)} asks for a split/panel composition: describe ONE "
+                        "continuous single frame instead (no diptych, no side-by-side panels, "
+                        "no two scenes in one image)")
+    if need_arc and not re.search(r"\barc\b\s*[:=]?\s*(\d+)\s*parts?\b", text or "", re.I):
+        gaps.append("the `Arc: N parts` line is missing, so the story's length is unknown")
+    if _spoken_words(shots) < 11:
+        gaps.append(f"the narration reads as captions ({_spoken_words(shots):.0f} words per "
+                    "shot): rewrite every Narration line as 2-3 connected sentences of a "
+                    "storyteller's voice-over, 16-20 words each, each line continuing the one "
+                    "before it, without describing the picture")
+    return gaps
+
+
+def _request_repair(messages: list[dict], text: str, gaps: list[str], api_key: str, *,
+                    gemini_key: str = "") -> str | None:
+    """Ask for the whole storyboard again, naming every detail that was missing."""
+    instruction = ("Your storyboard is incomplete. Keep the same story and output the WHOLE "
+                   "storyboard again, plain text, in exactly the same format, with nothing "
+                   "omitted. Fix all of these:\n" + "\n".join(f"- {gap}" for gap in gaps))
+    return _plan_request(messages + [
+        {"role": "assistant", "content": text},
+        {"role": "user", "content": instruction},
+    ], api_key, gemini_key=gemini_key)
 
 
 def parse_detailed_response(text: str) -> tuple[list[Shot], dict[int, str]]:
@@ -559,6 +670,42 @@ def _strip_signature(text: str, character: str) -> str:
     return text.strip(" ,")
 
 
+# A prompt that asks for two scenes in one frame gets exactly that: FLUX renders a diptych, a
+# split-screen or a diagonal composite, and the seam lands in the middle of a six-second hold.
+# "Composition splits horizontal: tree upper left, boy lower right" shipped in a published short.
+_SPLIT_LAYOUT = re.compile(
+    r"\b(diptych|triptych|split[- ]?screen|split composition|splits?|panels?|collage|"
+    r"side[- ]by[- ]side|two (?:scenes|images|panels)|divided (?:in|into) two|"
+    r"composite of two)\b", re.IGNORECASE)
+
+# A corrective clause contains the very words it forbids ("no split panels, no diptych"), so a
+# match only counts when it is not being ruled out.
+_NEGATIONS = ("no ", "not ", "never ", "without ", "avoid ", "single ", "one ")
+
+
+def _asks_for_split(text: str) -> bool:
+    """True when the text *requests* a split/panel frame rather than forbidding one."""
+    for match in _SPLIT_LAYOUT.finditer(text or ""):
+        window = (text or "")[max(0, match.start() - 28):match.start()].lower()
+        if not any(negation in window for negation in _NEGATIONS):
+            return True
+    return False
+
+
+def _unsplit_layout(text: str) -> tuple[str, bool]:
+    """Drop a request for a split/panel composition and ask for one frame instead.
+
+    Sentence-level, because the offending clause is always its own sentence ("Composition splits
+    horizontal: ..."). Returns (text, whether anything was rewritten).
+    """
+    sentences = re.split(r"(?<=[.!?])\s+", text or "")
+    kept = [sentence for sentence in sentences if not _asks_for_split(sentence)]
+    if len(kept) == len(sentences):
+        return text, False
+    cleaned = " ".join(kept).strip()
+    return (f"{cleaned} One continuous single frame, no split panels, no diptych.").strip(), True
+
+
 def anchor_prompt(prompt: str, character: bool, character_sig: str = "") -> str:
     """Force the art direction and identity anchor onto a planner-written image prompt.
 
@@ -569,6 +716,9 @@ def anchor_prompt(prompt: str, character: bool, character_sig: str = "") -> str:
     the arc's own signature, so each arc anchors to its own protagonist.
     """
     text = " ".join((prompt or "").split()).strip()
+    text, unsplit = _unsplit_layout(text)
+    if unsplit:
+        logger.info("Rewrote a split/panel composition request into one continuous frame")
     text = re.sub(r"[,.]?\s*engagement hook of [^.,]+[.,]?", "", text, flags=re.IGNORECASE)
     if not character:
         text = _strip_signature(text, character_sig)
@@ -755,6 +905,65 @@ def _declared_count(text: str) -> int:
     return int(match.group(1)) if match else 0
 
 
+# Words that cannot end a title. Cutting a narration clause at a fixed word count lands on one
+# of these often enough that "Rain drummed on the tin roof while" became a real upload title.
+_DANGLING_ENDINGS = frozenset("""
+a an the and but or nor so yet for because as if when while that which who whom whose
+of to in on at by with from into onto over under after before during through across about
+against between without within upon than then where why how
+""".split())
+
+
+def _strip_dangling(words: list[str]) -> list[str]:
+    """Drop words that leave a phrase hanging off the end of a title."""
+    out = list(words)
+    while out and out[-1].strip("\"'`,").lower() in _DANGLING_ENDINGS:
+        out.pop()
+    return out
+
+
+# Words that cannot open a standalone title phrase: a clause starting with one of these is
+# dependent ("because she had promised"), not a name.
+_LEADING_DEPENDENT = frozenset("""
+and but or nor so yet because when while if though although as since until after before then
+than that which who whom whose
+""".split())
+
+
+def title_from_line(line: str, *, max_words: int = 7) -> str:
+    """A short, complete title phrase from a narration line, or "" when there isn't one.
+
+    Splits on clause punctuation, trims to `max_words`, then drops a dangling conjunction or
+    preposition — a fixed word count on its own cut mid-phrase. Clauses that open on a
+    subordinator are dependent, so they are skipped rather than published as a title.
+    """
+    for clause in re.split(r"[,.;:!?—–]|\s-\s", line or ""):
+        words = _strip_dangling(clause.split()[:max_words])
+        if len(words) < 2:
+            continue
+        if words[0].strip("\"'`").lower() in _LEADING_DEPENDENT:
+            continue
+        return " ".join(words).strip("\"'` ")
+    return ""
+
+
+def _validate_title(title: str) -> str:
+    """Return `title` if it can be published as a story name, else "".
+
+    A title is a name, not a sentence: it must have letters, stay short, and not stop on a word
+    that leaves it hanging ("The Girl Who Waited Because").
+    """
+    title = re.sub(r"\s+", " ", (title or "").strip().strip("*_`\"'")).rstrip(".")
+    if not title or not re.search(r"[A-Za-z]", title):
+        return ""
+    words = title.split()
+    if len(title) > 90 or len(words) > 12:
+        return ""
+    if words[-1].strip("\"'`,").lower() in _DANGLING_ENDINGS:
+        return ""
+    return title
+
+
 def parse_title(text: str) -> str:
     """Read the story title the planner states as `Title: ...`.
 
@@ -767,29 +976,106 @@ def parse_title(text: str) -> str:
                       text or "", re.IGNORECASE | re.MULTILINE)
     if not match:
         return ""
-    title = match.group(1).strip().strip("\"'`*")
-    # A title is a name, not a sentence: drop a trailing period and any stray markdown.
-    title = re.sub(r"\s+", " ", title).rstrip(".")
-    if len(title) > 90 or len(title.split()) > 12:
-        logger.info("Planner title too long (%d chars); ignoring it", len(title))
-        return ""
+    title = _validate_title(match.group(1))
+    if not title:
+        logger.info("Planner title unusable (%r); ignoring it", match.group(1)[:60])
     return title
+
+
+TITLE_INSTRUCTIONS = (
+    "You name short films. Reply with the title only — no quotes, no 'Title:', no explanation. "
+    "Two to five words, concrete, naming this story rather than describing the picture.")
+
+
+def _clean_title_line(text: str) -> str:
+    """Pull a title out of a reply that was asked for one and gave a line."""
+    line = next((raw.strip() for raw in (text or "").splitlines() if raw.strip()), "")
+    line = line.strip("*_`\"' ")
+    if ":" in line:  # "Sure, here is a title: The Lantern" -> "The Lantern"
+        line = line.rsplit(":", 1)[1]
+    line = line.split(".")[0]
+    return _validate_title(line)
+
+
+def request_title(shots: list[Shot], api_key: str, *, gemini_key: str = "",
+                  attempts: int = 2) -> str:
+    """Ask for the story's name when the plan came back without a `Title:` line.
+
+    Cutting a title out of narration prose is lossy — it produced "Mira has spent three long
+    years trapping". One short follow-up is cheaper than putting that name on every part of the
+    arc, so the planner is asked directly, and the prose cut is only the last resort.
+    """
+    beats = "\n".join(f"- {shot.speech}" for shot in shots if shot.speech)[:1500]
+    if not beats:
+        return ""
+    messages = [
+        {"role": "system", "content": TITLE_INSTRUCTIONS},
+        {"role": "user", "content": f"Story beats:\n{beats}\n\nReply with the title only."},
+    ]
+    for attempt in range(1, attempts + 1):
+        # A title is short by design, so the storyboard length floor must not apply here.
+        title = _clean_title_line(
+            _plan_request(messages, api_key, min_words=1, gemini_key=gemini_key) or "")
+        if title:
+            logger.info("Titled by a follow-up request: %s", title)
+            return title
+        logger.warning("Title request %d/%d returned nothing usable", attempt, attempts)
+    return ""
+
+
+# Roles whose `Story object` makes the best title, in order: the payload beat names the thing the
+# story is about, the emotional beat names what it cost.
+_TITLE_ROLES = ("deliver_payload", "emotional_beat", "evidence", "resolution", "build_tension")
+
+
+_SMALL_WORDS = frozenset("a an the of and or in on at to from with for among over under".split())
+
+
+def _title_case(phrase: str) -> str:
+    """`the iron lantern` -> `The Iron Lantern`: a story name, not a sentence."""
+    words = phrase.split()
+    return " ".join(
+        word if (i and word.lower() in _SMALL_WORDS) else word[:1].upper() + word[1:]
+        for i, word in enumerate(words))
+
+
+def title_from_plan(shots: list[Shot]) -> str:
+    """Name the story from the plan's own structured fields when the planner did not name it.
+
+    `Story object` is the one field written as a short noun phrase ("iron lantern", "fresh yellow
+    ribbon among faded ones"), which is what a title needs. Prose only ever yields a cut sentence,
+    and a word count cannot tell a noun phrase from a gerund.
+    """
+    for role in _TITLE_ROLES:
+        for shot in shots:
+            if shot.narrative_role != role:
+                continue
+            words = " ".join((shot.story_object or "").split()).split()[:3]
+            while words and (words[-1].strip(",").lower() in _DANGLING_ENDINGS
+                             or words[-1].lower().endswith("ing")):
+                words.pop()
+            if not words:
+                continue
+            phrase = " ".join(words).strip("\"'` ,")
+            if not phrase or phrase.lower() in ("no object", "none", "n a", "n/a"):
+                continue
+            if phrase.split()[0].lower() not in ("the", "a", "an"):
+                phrase = f"The {phrase}"
+            return _validate_title(_title_case(phrase))
+    return ""
 
 
 def fallback_title(shots: list[Shot]) -> str:
     """Build a title from the opening narration when the planner did not name the story.
 
-    Takes the first clause of the first spoken line and title-cases it, so an unnamed story
-    still uploads as something readable instead of a date.
+    Uses the first shot whose narration yields a complete phrase, so an unnamed story still
+    uploads as something readable instead of a date — or, worse, a fragment cut mid-clause.
+    Returns "" when no shot carries usable narration.
     """
     for shot in shots:
-        line = shot.speech
-        if not line:
-            continue
-        clause = re.split(r"[,.;:!?]", line, maxsplit=1)[0].strip()
-        words = clause.split()[:7]
-        if words:
-            return " ".join(words).strip("\"'")
+        title = title_from_line(shot.speech)
+        if title:
+            return title
     return ""
 
 
@@ -830,6 +1116,7 @@ def plan_shorts_detailed(
     total_parts: int | None = 1,
     story_so_far: list[str] | None = None,
     parts_range: tuple[int, int] = (1, MAX_PARTS),
+    gemini_key: str = "",
 ) -> tuple[list[Shot], dict[int, str], bool, int]:
     """Run the detailed prompt and parse its structured output.
 
@@ -918,7 +1205,7 @@ def plan_shorts_detailed(
         {"role": "user", "content": user},
     ]
 
-    text = _plan_request(messages, api_key)
+    text = _plan_request(messages, api_key, gemini_key=gemini_key)
 
     if not text:
         logger.warning("Detailed planner unavailable; falling back to basic plan_shots")
@@ -926,34 +1213,26 @@ def plan_shorts_detailed(
 
     shots, image_prompts = parse_detailed_response(text)
 
-    # One bounded repair attempt: a plan far short of the pacing window, or narration written as
-    # 8-word captions instead of a story, is worth re-asking for — but never more than once, an
-    # unattended run cannot spend the day retrying.
-    repair = ""
-    if want and 0 < len(shots) < want - 2:
-        repair = (f"That was {len(shots)} shots. Output the whole storyboard again with exactly "
-                  f"{want} shots and exactly {want} numbered image prompts.")
-    elif shots and _spoken_words(shots) < 11:
-        logger.info("Narration averages %.1f words per shot; asking once for prose",
-                    _spoken_words(shots))
-        repair = ("The narration reads as captions: it averages "
-                  f"{_spoken_words(shots):.0f} words per shot. Keep the same shots and image "
-                  "prompts, but rewrite every Narration line as 2-3 connected sentences of a "
-                  "storyteller's voice-over, 16-20 words each, each line continuing the one "
-                  "before it. Do not describe the picture.")
-    if repair and text:
-        logger.info("Repairing the plan: %s", repair.split(".")[0])
-        retry = messages + [
-            {"role": "assistant", "content": text},
-            {"role": "user", "content": repair},
-        ]
-        text2 = _plan_request(retry, api_key)
-        if text2:
-            shots2, image_prompts2 = parse_detailed_response(text2)
-            better_count = want and len(shots2) > len(shots)
-            better_words = shots2 and _spoken_words(shots2) > _spoken_words(shots) + 3
-            if better_count or better_words:
-                shots, image_prompts, text = shots2, image_prompts2, text2
+    # A reply that is missing detail is re-asked, not salvaged: the parser has a default for every
+    # field, so a skipped `Action` or `Story object` looks exactly like one the planner wrote, and
+    # the fabrication then ships in the video. Two bounded rounds, and a round that does not reduce
+    # the gap count is discarded — an unattended run cannot spend the day retrying.
+    for round_no in range(1, PLAN_REPAIR_ROUNDS + 1):
+        gaps = _plan_gaps(text, shots, image_prompts, want=want, need_arc=decide_arc)
+        if not gaps:
+            break
+        logger.info("Plan is incomplete (round %d/%d): %s",
+                    round_no, PLAN_REPAIR_ROUNDS, "; ".join(gaps))
+        repaired = _request_repair(messages, text, gaps, api_key, gemini_key=gemini_key)
+        if not repaired:
+            break
+        shots2, image_prompts2 = parse_detailed_response(repaired)
+        remaining = _plan_gaps(repaired, shots2, image_prompts2, want=want, need_arc=decide_arc)
+        if len(remaining) >= len(gaps):
+            logger.warning("Repair left %d gap(s) of %d; keeping the first plan",
+                           len(remaining), len(gaps))
+            break
+        shots, image_prompts, text = shots2, image_prompts2, repaired
 
     if not shots:
         logger.warning("Detailed planner returned 0 shots; falling back")
@@ -993,7 +1272,8 @@ def plan_shorts_detailed(
 
     logger.info("Detailed scene plan: %d shots, %d unique image prompts",
                 len(shots), len(image_prompts))
-    title = parse_title(text) or fallback_title(shots)
+    title = (parse_title(text) or request_title(shots, api_key, gemini_key=gemini_key)
+             or title_from_plan(shots) or fallback_title(shots))
     if title:
         logger.info("Story title: %s", title)
     else:
@@ -1009,18 +1289,28 @@ PLANNER_MAX_TOKENS = 4096  # Workers AI path only; the OpenRouter path is delibe
 OPENROUTER_MAX_TOKENS = 0  # 0 = send no max_tokens at all
 
 
-def _plan_request(messages, api_key: str) -> str | None:
-    """Planning goes to OpenRouter only.
+def _plan_request(messages, api_key: str, *, min_words: int = 40,
+                  gemini_key: str = "") -> str | None:
+    """Planning goes to Antigravity first, then OpenRouter.
 
-    Workers AI's 10,000 free neurons per day are reserved for image generation: a storyboard is
-    the largest text request the pipeline makes, and spending neurons on it is what starved the
-    renders. No planner in this module accepts Workers AI credentials, so the split is enforced
-    by the signatures rather than by this comment.
+    Antigravity is the first-priority text provider whenever credentials are configured; OpenRouter's free
+    models and then the local template are the fallbacks. Workers AI's 10,000 free neurons per day
+    stay reserved for image generation: a storyboard is the largest text request the pipeline
+    makes, and spending neurons on it is what starved the renders. No planner in this module
+    accepts Workers AI credentials, so the split is enforced by the signatures rather than by this
+    comment.
     """
+    if gemini_key:
+        content = gemini.text(messages, key=gemini_key, min_words=min_words)
+        if content:
+            logger.info("Planner answered via Antigravity (%d words)", len(content.split()))
+            return content
+        logger.warning("Antigravity planner produced nothing; trying the next text provider")
     if not api_key:
-        logger.warning("No OPENROUTER_API_KEY: planning falls back to the local template")
+        logger.warning("No text provider credential (Antigravity OAuth / OpenRouter): "
+                       "planning falls back to the local template")
         return None
-    text = _openrouter(messages, api_key)
+    text = _openrouter(messages, api_key, min_words=min_words)
     if not text:
         logger.warning("Planner produced nothing; falling back to the local template")
     return text
@@ -1106,7 +1396,14 @@ def _workers_ai(messages, cfa_token: str, account_id: str) -> str | None:
     return None
 
 
-def _openrouter(messages, api_key: str) -> str | None:
+def _openrouter(messages, api_key: str, *, min_words: int = 40) -> str | None:
+    """Ask the OpenRouter model list for a completion, rejecting degenerate replies.
+
+    `min_words` guards against a thinking model that spends its whole budget on reasoning and
+    returns two words of answer. It is a parameter because not every request wants a storyboard:
+    a title is three words by design, and the 40-word floor used to make every title reply look
+    like a failure.
+    """
     if not api_key:
         return None
     raw = os.environ.get("OPENROUTER_MODELS", "").strip()
@@ -1131,14 +1428,14 @@ def _openrouter(messages, api_key: str) -> str | None:
         body = r.json()
         content = ((body.get("choices") or [{}])[0].get("message") or {}).get("content")
         detail = _choice_detail(body)
-        if content and len(content.split()) > 40:
+        if content and len(content.split()) >= min_words:
             if (body.get("choices") or [{}])[0].get("finish_reason") == "length":
                 logger.warning("OpenRouter planner %s reply was cut off (%s); the storyboard may "
                                "be short of the end", model, detail)
             logger.info("Planner answered via OpenRouter %s (%d words, %s)",
                         model, len(content.split()), detail)
             return content
-        logger.warning("OpenRouter planner %s returned %d usable word(s) (%s)",
-                       model, len((content or "").split()), detail)
+        logger.warning("OpenRouter planner %s returned %d usable word(s), wanted %d (%s)",
+                       model, len((content or "").split()), min_words, detail)
     logger.warning("OpenRouter planner produced nothing for %s", ", ".join(models))
     return None

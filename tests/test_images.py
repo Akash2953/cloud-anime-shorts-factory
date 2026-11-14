@@ -118,6 +118,92 @@ class TestProduceImages(unittest.TestCase):
         self.assertEqual([c[0] for c in self.calls], ["fresh"])
 
 
+class TestShotRetry(unittest.TestCase):
+    """A failed shot must not silently delete its narration line from the story."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        self.calls: list[str] = []
+        self.beats = [f"beat number {i} is a complete sentence." for i in range(1, 5)]
+        # Retries are exercised without the real backoff sleep.
+        self._backoff = images.RETRY_BACKOFF_S
+        images.RETRY_BACKOFF_S = 0
+
+    def tearDown(self):
+        images.RETRY_BACKOFF_S = self._backoff
+        self.tmp.cleanup()
+
+    def _scripted(self, failures: dict[int, int]):
+        """Fail the Nth shot `failures[N]` times with a retryable 500, then succeed."""
+        seen: dict[int, int] = {}
+
+        def fn(prompt, token, account):
+            self.calls.append(prompt)
+            # Prompts are `beat number N is a complete sentence.` — key attempts per shot, so a
+            # retry is attributed to the shot it belongs to rather than to the next one.
+            n = int(prompt.split("number ")[1].split()[0]) - 1
+            seen[n] = seen.get(n, 0) + 1
+            if seen[n] <= failures.get(n, 0):
+                return images.ImageResult(ok=False, error="status_500")
+            return images.ImageResult(ok=True, data=_jpeg(str(n).encode()))
+        return fn
+
+    def test_transient_failure_is_retried_within_the_same_shot(self):
+        images.generate_fresh = self._scripted({1: 1})   # shot 2 fails once
+        frames, _ = images.produce_images(
+            self.beats, cfa_token="t", account_id="a", img_dir=self.dir, strategy="fresh")
+        self.assertEqual(len(frames), 4)
+        self.assertEqual(len(self.calls), 5)             # 4 shots + 1 retry
+        self.assertTrue(all(p.exists() for p in frames))
+
+    def test_shot_that_never_renders_holds_the_previous_frame(self):
+        images.generate_fresh = self._scripted({2: images.SHOT_ATTEMPTS})  # shot 3 never renders
+        frames, _ = images.produce_images(
+            self.beats, cfa_token="t", account_id="a", img_dir=self.dir, strategy="fresh")
+        self.assertEqual(len(frames), 4)                 # every beat still has a frame
+        self.assertEqual(frames[2], frames[1])           # the hold
+        self.assertEqual(len(self.calls), 4 + images.SHOT_ATTEMPTS - 1)
+
+    def test_leading_hold_backfills_from_the_first_frame_that_rendered(self):
+        images.generate_fresh = self._scripted({0: images.SHOT_ATTEMPTS})  # shot 1 never renders
+        frames, _ = images.produce_images(
+            self.beats, cfa_token="t", account_id="a", img_dir=self.dir, strategy="fresh")
+        self.assertEqual(len(frames), 4)
+        self.assertEqual(frames[0], frames[1])
+
+    def test_retries_are_charged_to_the_daily_budget(self):
+        images.generate_fresh = self._scripted({0: 1})
+        budget = {"attempts": 0, "max": 4}
+        frames, _ = images.produce_images(
+            self.beats, cfa_token="t", account_id="a", img_dir=self.dir,
+            strategy="fresh", budget=budget)
+        self.assertEqual(budget["attempts"], 4)
+        self.assertLessEqual(len(frames), 4)
+
+    def test_retry_does_not_starve_the_remaining_shots(self):
+        # 4 beats, 5 attempts: shot 1 can retry once, then the reserve protects beats 2-4.
+        images.generate_fresh = self._scripted({0: 99})
+        budget = {"attempts": 0, "max": 5}
+        frames, _ = images.produce_images(
+            self.beats, cfa_token="t", account_id="a", img_dir=self.dir,
+            strategy="fresh", budget=budget)
+        self.assertEqual(len(self.calls), 5)
+        self.assertEqual(len(frames), 4)                 # every beat still plays
+        self.assertEqual(frames[0], frames[1])           # shot 1 held
+
+    def test_fatal_error_is_not_retried(self):
+        def fn(prompt, token, account):
+            self.calls.append("x")
+            return images.ImageResult(ok=False, error="auth_401")
+
+        images.generate_fresh = fn
+        frames, _ = images.produce_images(
+            self.beats, cfa_token="t", account_id="a", img_dir=self.dir, strategy="fresh")
+        self.assertEqual(frames, [])
+        self.assertEqual(len(self.calls), 1)             # one call, no retry
+
+
 class TestCropGrid(unittest.TestCase):
     def test_sheet_splits_into_equal_panels(self):
         with tempfile.TemporaryDirectory() as tmp:

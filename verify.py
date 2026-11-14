@@ -15,6 +15,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import gemini
 from audio import SAMPLE_RATE, Narration, join_with_gaps, write_wav
 from config import load_config
 from images import KLEIN, SCHNELL, image_ext, load_frames, produce_images
@@ -68,10 +69,20 @@ def main() -> int:
 
     cfg = load_config()
     print("--- credentials (presence only) ---")
-    for name in ("CFAI_TOKEN", "CF_ACCOUNT_ID", "OPENROUTER_API_KEY",
-                 "YOUTUBE_CLIENT_ID", "YOUTUBE_CLIENT_SECRET", "YOUTUBE_REFRESH_TOKEN"):
+    for name in ("ANTIGRAVITY_API_KEY", "ANTIGRAVITY_ACCESS_TOKEN", "ANTIGRAVITY_REFRESH_TOKEN",
+                 "ANTIGRAVITY_OAUTH_CLIENT_ID", "ANTIGRAVITY_PROJECT_ID", "CFAI_TOKEN",
+                 "CF_ACCOUNT_ID", "OPENROUTER_API_KEY", "YOUTUBE_CLIENT_ID",
+                 "YOUTUBE_CLIENT_SECRET", "YOUTUBE_REFRESH_TOKEN"):
         print(f"  {name:<22} {'set' if cfg.get(name) else 'MISSING'}")
-    print(f"  image models            {SCHNELL} + {KLEIN} (edit)\n")
+    antigravity_key = cfg["ANTIGRAVITY_API_KEY"]
+    print(f"  Antigravity auth         {'configured' if antigravity_key else 'not configured'}")
+    if antigravity_key:
+        print(f"  Antigravity text models  {', '.join(gemini.text_models(antigravity_key))}")
+        print(f"  Antigravity image models {', '.join(gemini.image_models(antigravity_key))} -> "
+              f"{SCHNELL} + {KLEIN} (Workers AI fallback)\n")
+    else:
+        print(f"  image provider           Workers AI ({SCHNELL} + {KLEIN}); "
+              "Antigravity not configured\n")
 
     count = args.shots or shots_for_duration(cfg["PREFERRED_SECONDS"])
 
@@ -79,7 +90,8 @@ def main() -> int:
     shots, fallback = plan_shots(
         theme="",
         count=count,
-        api_key=cfg["OPENROUTER_API_KEY"])
+        api_key=cfg["OPENROUTER_API_KEY"],
+        gemini_key=antigravity_key)
     roles = {s.narrative_role for s in shots}
     no_char = sum(1 for s in shots if not s.character)
     record("plan", not fallback and len(shots) >= 8 and len(roles) >= 4 and no_char >= 3,
@@ -104,7 +116,8 @@ def main() -> int:
             cfa_token=cfg["CFAI_TOKEN"], account_id=cfg["CF_ACCOUNT_ID"],
             img_dir=FRAMES, strategy=args.strategy,
             character_flags=[s.character for s in shots], character=character,
-            budget={"attempts": 0, "max": args.max_images})
+            budget={"attempts": 0, "max": args.max_images},
+            antigravity_key=antigravity_key)
         sizes = []
         for f in frames:
             try:

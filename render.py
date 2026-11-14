@@ -7,6 +7,52 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# An encode that dies leaves a half-written MP4 behind. That file is dangerous, not harmless: a
+# later `--render-only` run or the thumbnail step will happily read it. Each attempt therefore
+# starts by deleting the target, and a failed encode is retried once before the run gives up.
+RENDER_ATTEMPTS = 2
+DURATION_TOLERANCE = 0.25
+
+
+def _probe_seconds(path: Path) -> float | None:
+    """Container duration in seconds, or None when ffprobe cannot read the file."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, check=False).stdout.strip()
+        return float(out) if out else None
+    except (OSError, ValueError):
+        return None
+
+
+def _encode(cmd: list[str], output_path: Path, *, expected_seconds: float = 0.0,
+            attempts: int = RENDER_ATTEMPTS) -> bool:
+    """Run ffmpeg, verify what it produced, and retry a failed or truncated encode once."""
+    for attempt in range(1, attempts + 1):
+        output_path.unlink(missing_ok=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            tail = " | ".join((result.stderr or "").strip().splitlines()[-3:])
+            logger.error("FFmpeg attempt %d/%d failed (exit %d): %s",
+                         attempt, attempts, result.returncode, tail or "no stderr")
+        elif not output_path.exists() or output_path.stat().st_size == 0:
+            logger.error("FFmpeg attempt %d/%d exited 0 but wrote no output", attempt, attempts)
+        else:
+            seconds = _probe_seconds(output_path)
+            if not expected_seconds or seconds is None:
+                if attempt > 1:
+                    logger.info("Render succeeded on attempt %d/%d", attempt, attempts)
+                return True
+            if abs(seconds - expected_seconds) <= max(1.0, expected_seconds * DURATION_TOLERANCE):
+                if attempt > 1:
+                    logger.info("Render succeeded on attempt %d/%d (%.1fs)", attempt, attempts, seconds)
+                return True
+            logger.error("Encode is %.1fs but the timeline is %.1fs; discarding it",
+                         seconds, expected_seconds)
+    output_path.unlink(missing_ok=True)  # never leave a truncated video for a later stage
+    return False
+
 
 def _fit_filter(width: int, height: int, fit: str) -> str:
     """Build the scale/pad chain for the chosen fill strategy.
@@ -36,12 +82,12 @@ def _fit_chain(width: int, height: int, fit: str) -> str:
     if fit == "cover":
         return (
             f"scale={width}:{height}:force_original_aspect_ratio=increase:out_range=limited,"
-            f"crop={width}:{height}"
+            f"crop={width}:{height},setsar=1"
         )
     if fit == "contain":
         return (
             f"scale={width}:{height}:force_original_aspect_ratio=decrease:out_range=limited,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1"
         )
     raise ValueError(f"unknown fit mode: {fit}")
 
@@ -221,11 +267,7 @@ def render_narration(
 
     logger.info("Rendering %d beats, %.1fs total, audio=%s%s", len(durations), total,
                 audio_path.name, " + music" if has_music else "")
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if result.returncode != 0:
-        logger.error("FFmpeg failed: %s", result.stderr[-1500:])
-        return False
-    return output_path.exists()
+    return _encode(cmd, output_path, expected_seconds=total)
 
 
 def render_short(
@@ -284,12 +326,8 @@ def render_short(
         ]
 
         logger.info("Running FFmpeg: %s", " ".join(cmd))
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            logger.error("FFmpeg failed: %s", result.stderr[-800:])
-            return False
-
-        return output_path.exists()
+        return _encode(cmd, output_path,
+                       expected_seconds=len(image_paths) * duration_per_image)
     finally:
         if concat_file.exists():
             concat_file.unlink()

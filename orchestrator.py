@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-from audio import Narration, join_with_gaps, write_wav, SAMPLE_RATE
+from audio import AudioLineError, Narration, join_with_gaps, write_wav, SAMPLE_RATE
 from config import load_config, Limits
 from images import load_frames, produce_images
 from publish import exchange_refresh_token, upload_thumbnail, upload_video
@@ -26,7 +26,7 @@ from render import render_narration
 # captions is imported lazily inside run_pipeline; an offline or fast-iteration run that doesn't
 # have faster-whisper installed shouldn't pay its import cost on startup.
 from scenes import (MAX_PARTS, Shot, make_character, plan_arc, plan_shorts_detailed,
-                    reuse_image_refs, shots_for_duration, unique_prompts,
+                    reuse_image_refs, shots_for_duration, title_from_line, unique_prompts,
                     validate_story_position)
 from state import compute_fingerprint, parse_state, save_state, today_key
 
@@ -57,8 +57,11 @@ def story_title(state: dict) -> str:
         for shot in part or []:
             line = (shot.get("narration") or "").strip()
             if line and line.lower() not in ("none", "silent", ""):
-                clause = line.split(",")[0].split(".")[0].strip()
-                return " ".join(clause.split()[:7])
+                # Same complete-phrase rule as the planner fallback: a bare word count cut this
+                # to "Rain drummed on the tin roof while" once already.
+                title = title_from_line(line)
+                if title:
+                    return title
     return "Untitled Story"
 
 
@@ -147,6 +150,7 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None,
 
     plan_result = plan_shorts_detailed(
         theme="", character=character, api_key=cfg.get("OPENROUTER_API_KEY", ""),
+        gemini_key=cfg.get("ANTIGRAVITY_API_KEY", ""),
         want=want, target_seconds=target_seconds,
         part=part_number, total_parts=None if decide_arc else total_parts,
         story_so_far=story_so_far,
@@ -163,6 +167,7 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None,
     if not shots:
         arc, fallback = plan_arc(
             theme="", parts=1, per_part=want, api_key=cfg.get("OPENROUTER_API_KEY", ""),
+            gemini_key=cfg.get("ANTIGRAVITY_API_KEY", ""),
         )
         shots = arc[0] if arc else []
         image_prompts = {}
@@ -233,9 +238,40 @@ def beat_track(shots: list[Shot], spoken_segments: list[np.ndarray], *,
     return beats, track, holds
 
 
-def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
+def caption_preflight(cfg: dict) -> None:
+    """Say up front whether this interpreter can produce subtitles.
+
+    The caption stage degrades instead of aborting, which is right for an unattended run — but a
+    silent degrade is how a published short shipped with no subtitles at all. Checking before the
+    image quota is spent also names the interpreter that is missing the module, which is the
+    difference between "install it" and "the wrong python ran the pipeline".
+    """
+    if not cfg.get("WORD_CAPTIONS", True):
+        return
+    from captions import missing_caption_dependencies
+
+    missing = missing_caption_dependencies()
+    if not missing:
+        return
+    hint = "pip install -r requirements.txt, then re-run"
+    if "PIL" in missing:
+        logger.error("Captions are enabled but Pillow is missing in %s — this short would render "
+                     "WITHOUT subtitles. Fix: %s", sys.executable, hint)
+    if "faster_whisper" in missing:
+        logger.warning("Word-synced captions unavailable (faster_whisper missing in %s); "
+                       "subtitles fall back to one line per beat. Fix: %s",
+                       sys.executable, hint)
+
+
+def run_pipeline(*, render_only: bool = False,
                  reuse_frames: bool = False, plan_only: bool = False, part: int | None = None) -> None:
     cfg = load_config()
+    antigravity_key = cfg.get("ANTIGRAVITY_API_KEY", "")
+    logger.info("Text provider: %s; image provider: %s",
+                "antigravity-oauth" if antigravity_key else (
+                    "openrouter" if cfg.get("OPENROUTER_API_KEY") else "local template"),
+                "antigravity-oauth -> workers-ai" if antigravity_key else "workers-ai")
+    caption_preflight(cfg)
     state = load_state(Path("state.json"))
     fps = 24
     shots, part_num, total_parts, state = resolve_part(cfg, state, part=part, plan_only=plan_only)
@@ -260,13 +296,6 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
         else:
             logger.warning("Only %d existing frames but need %d", len(frames), len(shots))
             frames = []
-    elif offline_images:
-        from images import OFFLINE_IMAGE_DATA
-        img_dir = Path("build/frames")
-        img_dir.mkdir(parents=True, exist_ok=True)
-        n = len(shots)
-        frames = [images._save(OFFLINE_IMAGE_DATA, img_dir, i) for i in range(n)]
-        strategy = "offline"
     else:
         img_dir = Path("build/frames")
         daily_cfg = state.setdefault("daily", {}).setdefault(today_key(), {})
@@ -287,6 +316,7 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
                 final_prompts, cfa_token=cfg["CFAI_TOKEN"],
                 account_id=cfg["CF_ACCOUNT_ID"], img_dir=img_dir,
                 strategy=strategy, character_flags=chars, character=character, budget=budget,
+                antigravity_key=antigravity_key,
             )
             paired = [(shot, rendered[slot]) for shot, slot in zip(shots, slots)
                       if slot < len(rendered)]
@@ -327,6 +357,28 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
 
     narration_tts = Narration(voice=cfg["KOKORO_VOICE"])
     speech = [shot.speech for shot in shots]
+
+    # The CTA is synthesised first, in its own voice, so the story lines can be paced into
+    # whatever time is left. It is never time-scaled: squeezing the ask to fit is what made it
+    # sound like another narration line. A CTA that will not voice is dropped rather than
+    # failing the short — it is the one beat whose absence costs nothing.
+    cta_audio = None
+    if cta_index is not None and speech[cta_index]:
+        from cta import CTA_SPEED, CTA_VOICE
+        try:
+            cta_audio = narration_tts.line(
+                speech[cta_index], label="CTA",
+                voice=cfg.get("CTA_VOICE") or CTA_VOICE,
+                speed=float(cfg.get("CTA_SPEED") or CTA_SPEED))
+            logger.info("CTA voice=%s speed=%.2f, %.1fs",
+                        cfg.get("CTA_VOICE") or CTA_VOICE,
+                        float(cfg.get("CTA_SPEED") or CTA_SPEED),
+                        len(cta_audio) / SAMPLE_RATE)
+        except AudioLineError as exc:
+            logger.warning("%s — dropping the call to action from this short", exc)
+            del shots[cta_index], frames[cta_index], speech[cta_index]
+            cta_index = None
+
     spoken = [i for i, text in enumerate(speech) if text]
     silent_hold = sum(shot.seconds for shot in shots if not shot.speech)
     if len(spoken) < len(shots):
@@ -335,37 +387,38 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
     if not spoken:
         logger.warning("Every beat is silent; the short will render without narration")
 
-    # The CTA is synthesised first, in its own voice, so the story lines can be paced into
-    # whatever time is left. It is never time-scaled: squeezing the ask to fit is what made it
-    # sound like another narration line.
-    cta_audio = None
-    if cta_index is not None and speech[cta_index]:
-        from cta import CTA_SPEED, CTA_VOICE
-        cta_audio = narration_tts.wav(speech[cta_index],
-                                      voice=cfg.get("CTA_VOICE") or CTA_VOICE,
-                                      speed=float(cfg.get("CTA_SPEED") or CTA_SPEED))
-        logger.info("CTA voice=%s speed=%.2f, %.1fs",
-                    cfg.get("CTA_VOICE") or CTA_VOICE,
-                    float(cfg.get("CTA_SPEED") or CTA_SPEED),
-                    len(cta_audio) / SAMPLE_RATE)
-
     # Only spoken beats are synthesised; the silent ones become their planned hold.
     story_positions = [p for p, i in enumerate(spoken) if i != cta_index]
     story_texts = [speech[spoken[p]] for p in story_positions]
     cta_hold = len(cta_audio) / SAMPLE_RATE if cta_audio is not None else 0.0
     budget = (target_seconds - BEAT_GAP * (len(shots) - 1) - TAIL_HOLD - silent_hold
               - cta_hold)
-    raw = [narration_tts.wav(t) for t in story_texts]
-    scaled_story, speed = (narration_tts.synth_scaled(story_texts, target_seconds=budget)
-                           if story_texts else ([], 1.0))
+    try:
+        raw = [narration_tts.line(t, label=f"beat {spoken[p] + 1}")
+               for p, t in zip(story_positions, story_texts)]
+        scaled_story, speed = (narration_tts.synth_scaled(story_texts, target_seconds=budget)
+                               if story_texts else ([], 1.0))
+    except AudioLineError as exc:
+        # A missing line cannot be patched downstream: abort before spending the render, leave
+        # the queue untouched so tomorrow retries the same part.
+        logger.error("%s — aborting before render; queue untouched", exc)
+        return
+
     # Rebuild the per-beat segment list in `spoken` order, splicing the CTA back in.
     scaled: list[np.ndarray] = []
     story_iter = iter(scaled_story)
     for i in spoken:
         scaled.append(cta_audio if i == cta_index else next(story_iter))
+    if len(scaled) != len(spoken):
+        logger.error("Narration produced %d segment(s) for %d spoken beat(s); aborting",
+                     len(scaled), len(spoken))
+        return
     natural = sum(len(a) for a in scaled) / SAMPLE_RATE
 
     beats, audio, durations = beat_track(shots, scaled)
+    if not len(audio):
+        logger.error("Narration track is empty; aborting before render")
+        return
     total = sum(durations)
     speech_duration = sum(len(b) for b in beats) / SAMPLE_RATE
     # seconds of audio per second of video: must stay ~1.0, so a >6 reading means real drift.
@@ -406,8 +459,9 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
 
     # Optional word-synced captions: faster-whisper aligns the joined narration -> per-word
     # timestamps -> pack into 1/2/3-word groups -> render one PNG each -> ffmpeg overlay them.
-    # The whole stage is wrapped so a missing model, misfit font or whisper drift logs and
-    # leaves `overlays=None` — the existing line-level render path stays untouched.
+    # If word alignment is unavailable the caption builder falls back to line-level captions
+    # timed against the beat holds, so the short still ships with subtitles. Only a total
+    # failure of the stage itself (bad font, unwritable dir) drops the overlays.
     overlays: list[tuple[Path, float, float]] | None = None
     if cfg.get("WORD_CAPTIONS", True):
         try:
@@ -420,6 +474,14 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
             if cta_index is not None and speech[cta_index]:
                 cta_start = sum(durations[:cta_index])
                 cta_block = (speech[cta_index], cta_start, cta_start + durations[cta_index])
+            # Per-beat (text, start, end) for the line-level caption fallback.
+            caption_segments: list[tuple[str, float, float]] = []
+            beat_start = 0.0
+            for i, shot in enumerate(shots):
+                beat_end = beat_start + durations[i]
+                if shot.speech:
+                    caption_segments.append((shot.speech, beat_start, beat_end))
+                beat_start = beat_end
             overlays = build_caption_overlays(
                 audio_path,
                 nar_text,
@@ -430,8 +492,14 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
                 whisper_model=cfg.get("WHISPER_MODEL", "base.en"),
                 gap_tight_ms=int(cfg.get("WORD_GAP_MS", 350)),
                 cta_block=cta_block,
+                segments=caption_segments,
             )
             logger.info("Captions: %d overlay PNGs prepared", len(overlays))
+            if not overlays and nar_text:
+                # A narrated short with no captions is a visible defect. Say so loudly rather
+                # than shipping it silently.
+                logger.error("Captions enabled but no overlays were produced for %d chars of "
+                             "narration; the video will have NO subtitles", len(nar_text))
         except Exception as exc:  # noqa: BLE001 — captions must not abort the upload
             logger.warning("Caption generation failed (%s); rendering without subtitles", exc)
             overlays = None
@@ -498,6 +566,18 @@ def run_pipeline(*, render_only: bool = False, offline_images: bool = False,
     if daily["uploads"] >= Limits.max_daily_uploads:
         logger.info("Upload limit reached today — skipping further publishing this run.")
 
+    # Only now is the media disposable: YouTube has the video and state.json has the story. Anything
+    # that failed above returned before this point, so a broken run keeps its artefacts for a
+    # re-render or a post-mortem.
+    if cfg.get("CLEANUP_AFTER_UPLOAD", True):
+        try:
+            from cleanup import remove_artifacts
+            remove_artifacts()
+        except Exception as exc:  # noqa: BLE001 — never fail a published upload over disk space
+            logger.warning("Cleanup failed (%s); artefacts kept", exc)
+    else:
+        logger.info("Cleanup disabled (CLEANUP_AFTER_UPLOAD=false); artefacts kept for a re-render")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Cloud Anime Shorts Factory pipeline")
@@ -505,12 +585,10 @@ if __name__ == "__main__":
                         help="stop after rendering and skip upload")
     parser.add_argument("--plan-only", action="store_true",
                         help="generate a fresh story only; write state and exit before images/render/upload")
-    parser.add_argument("--offline-images", action="store_true",
-                        help="generate placeholder frames (no API key required)")
     parser.add_argument("--reuse-frames", action="store_true",
                         help="skip regeneration; reuse build/frames/frame_*.ext")
     parser.add_argument("--part", type=int, default=None, metavar="N",
                         help="plan/preview part N of the arc without touching the publish queue")
     args = parser.parse_args()
-    run_pipeline(render_only=args.render_only, offline_images=args.offline_images,
+    run_pipeline(render_only=args.render_only,
                  reuse_frames=args.reuse_frames, plan_only=args.plan_only, part=args.part)

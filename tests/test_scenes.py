@@ -292,13 +292,20 @@ class TestPromptAnchoring(unittest.TestCase):
         self.assertIn(CHARACTER, shots[1].image_generation_prompt)
 
 
-def detailed_reply(n: int) -> str:
-    """A synthetic detailed-planner reply: n shot blocks, one image prompt each."""
-    blocks = [f"Short 1: {n} shots, {n} images.\n"]
+def detailed_reply(n: int, *, complete: bool = True) -> str:
+    """A synthetic detailed-planner reply: n shot blocks, one image prompt each.
+
+    Complete by default (every field the prompt contract asks for, plus an `Arc:` line), so the
+    repair loop stays out of the way unless a test is specifically about a missing detail.
+    """
+    blocks = [f"Arc: 1 part\nShort 1: {n} shots, {n} images.\n"]
     for i in range(1, n + 1):
+        extra = ("- Place: a flooded walkway\n- Story object: a paper lantern\n"
+                 "- Narrative role: build_tension\n- Audio notes: rain\n- Transition: cut\n"
+                 if complete else "")
         blocks.append(
             f"\nShot {i}:\n- Duration: 3\n- Shot type: wide\n- Character on screen: no\n"
-            f"- Camera movement: static\n- Visual description: place {i}\n"
+            f"- Camera movement: static\n{extra}- Visual description: place {i}\n"
             f"- Action: something happens in {i}\n"
             f"- Narration: \"She crosses the flooded walkway and counts the lanterns above her "
             f"again, because the last time she stood here there were twelve of them and now "
@@ -395,7 +402,8 @@ class TestNarrationDensity(unittest.TestCase):
             "She crosses the flooded walkway and counts the lanterns above her again, because "
             "the last time she stood here there were twelve of them and now there are only "
             "eleven left.", "Gold eyes. Targeting.")
-        with patch("scenes._openrouter", side_effect=[prose, captions]) as planner:
+        with patch("scenes.request_title", return_value=""), \
+             patch("scenes._openrouter", side_effect=[prose, captions]) as planner:
             shots, _, fallback, _, _title = plan_shorts_detailed(theme="t", api_key="k", want=8,
                                                         target_seconds=55)
         self.assertEqual(planner.call_count, 2)              # one repair, then it stops
@@ -405,7 +413,8 @@ class TestNarrationDensity(unittest.TestCase):
     def test_the_request_states_the_word_budget(self):
         from unittest.mock import patch
         from scenes import plan_shorts_detailed
-        with patch("scenes._openrouter", return_value=detailed_reply(8)) as planner:
+        with patch("scenes.request_title", return_value=""), \
+             patch("scenes._openrouter", return_value=detailed_reply(8)) as planner:
             plan_shorts_detailed(theme="t", api_key="k", want=8, target_seconds=55)
         sent = planner.call_args[0][0]
         self.assertIn("about 145 words", sent[0]["content"])
@@ -417,7 +426,8 @@ class TestPlannerCountRequest(unittest.TestCase):
     def test_request_states_the_required_shot_count(self):
         from unittest.mock import patch
         from scenes import plan_shorts_detailed
-        with patch("scenes._openrouter", return_value=detailed_reply(8)) as planner:
+        with patch("scenes.request_title", return_value=""), \
+             patch("scenes._openrouter", return_value=detailed_reply(8)) as planner:
             shots, _, _, _, _title = plan_shorts_detailed(theme="lantern city", api_key="k", want=8)
         self.assertEqual(len(shots), 8)
         sent = planner.call_args[0][0]
@@ -427,7 +437,8 @@ class TestPlannerCountRequest(unittest.TestCase):
     def test_one_repair_attempt_when_the_plan_is_short(self):
         from unittest.mock import patch
         from scenes import plan_shorts_detailed
-        with patch("scenes._openrouter",
+        with patch("scenes.request_title", return_value=""), \
+             patch("scenes._openrouter",
                    side_effect=[detailed_reply(3), detailed_reply(6)]) as planner:
             shots, _, fallback, _arc, _title = plan_shorts_detailed(theme="lantern city", api_key="k", want=8)
         self.assertEqual(planner.call_count, 2)
@@ -437,7 +448,8 @@ class TestPlannerCountRequest(unittest.TestCase):
     def test_no_second_attempt_when_the_plan_is_close_enough(self):
         from unittest.mock import patch
         from scenes import plan_shorts_detailed
-        with patch("scenes._openrouter", return_value=detailed_reply(7)) as planner:
+        with patch("scenes.request_title", return_value=""), \
+             patch("scenes._openrouter", return_value=detailed_reply(7)) as planner:
             plan_shorts_detailed(theme="lantern city", api_key="k", want=8)
         self.assertEqual(planner.call_count, 1)
 
@@ -458,6 +470,61 @@ class TestPlannerCountRequest(unittest.TestCase):
             shots, _, fallback, _arc, _title = plan_shorts_detailed(theme="lantern city", api_key="")
         orouter.assert_not_called()
         self.assertEqual((shots, fallback), ([], True))
+
+
+class TestTitleRequest(unittest.TestCase):
+    """A plan that forgets `Title:` gets asked for one, instead of uploading cut prose."""
+
+    def test_missing_title_triggers_a_follow_up_request(self):
+        from unittest.mock import patch
+        from scenes import plan_shorts_detailed
+        with patch("scenes._openrouter",
+                   side_effect=[detailed_reply(8), "The Lantern That Remembered"]) as planner:
+            shots, _, fallback, _arc, title = plan_shorts_detailed(
+                theme="t", api_key="k", want=8)
+        self.assertFalse(fallback)
+        self.assertEqual(planner.call_count, 2)
+        self.assertEqual(title, "The Lantern That Remembered")
+        # the follow-up is a title request, not a second storyboard: it carries the beats only
+        self.assertIn("Reply with the title only", planner.call_args[0][0][-1]["content"])
+
+    def test_a_stated_title_costs_no_extra_request(self):
+        from unittest.mock import patch
+        from scenes import plan_shorts_detailed
+        reply = detailed_reply(8).replace("Short 1: 8 shots, 8 images.",
+                                          "Title: The Lantern That Remembered\n"
+                                          "Short 1: 8 shots.")
+        with patch("scenes._openrouter", return_value=reply) as planner:
+            _, _, _, _, title = plan_shorts_detailed(theme="t", api_key="k", want=8)
+        self.assertEqual(planner.call_count, 1)
+        self.assertEqual(title, "The Lantern That Remembered")
+
+    def test_a_useless_reply_falls_back_to_a_complete_phrase(self):
+        from unittest.mock import patch
+        from scenes import plan_shorts_detailed
+        with patch("scenes._openrouter",
+                   side_effect=[detailed_reply(8), "", ""]):
+            _, _, _, _, title = plan_shorts_detailed(theme="t", api_key="k", want=8)
+        self.assertTrue(title)
+        self.assertFalse(title.lower().endswith((" while", " and", " because", " of")))
+
+    def test_title_request_cleans_chatty_replies(self):
+        from unittest.mock import patch
+        from scenes import request_title
+        from scenes import _template_shots
+        for reply, expected in [("Title: The Lantern", "The Lantern"),
+                                ('"The Lantern"', "The Lantern"),
+                                ("Sure! Here is a title: The Lantern.", "The Lantern"),
+                                ("The Lantern\nHope that helps!", "The Lantern")]:
+            with patch("scenes._plan_request", return_value=reply):
+                self.assertEqual(request_title(_template_shots(3), "k"), expected, reply)
+
+    def test_title_request_reports_failure_without_beats(self):
+        from unittest.mock import patch
+        from scenes import request_title
+        with patch("scenes._plan_request") as planner:
+            self.assertEqual(request_title([], "k"), "")
+        planner.assert_not_called()
 
 
 class TestProviderErrors(unittest.TestCase):

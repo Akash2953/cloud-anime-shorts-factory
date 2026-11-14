@@ -10,9 +10,9 @@ Stages:
     3. classify_word       stopword-vs-content -> color slot for each word
     4. render_group_pngs   one 1080-wide PNG per group, ready for ffmpeg overlay
 
-Graceful degrade: any failure logs and returns []. Caller should then run
-render_narration(frames, durations, audio_path, output_path) without overlays,
-so the existing line-level path is preserved.
+Graceful degrade: when word alignment fails, `build_caption_overlays` falls back to
+LINE-LEVEL captions derived from the narration text and the beat timing, so the short always
+ships with subtitles. A missing faster-whisper install must never mean a silent video.
 """
 
 from __future__ import annotations
@@ -132,6 +132,22 @@ class GroupCue:
 # ----------------------------------------------------------------------------------------------
 
 
+def missing_caption_dependencies() -> list[str]:
+    """Importable modules the caption stage needs, which the plain pipeline does not.
+
+    `faster_whisper` missing only downgrades word sync to line-level captions; Pillow missing
+    means no caption PNGs can be rendered at all. The orchestrator checks this before spending
+    image quota, because a caption-less publish used to look like a healthy run.
+    """
+    missing: list[str] = []
+    for module in ("faster_whisper", "PIL"):
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(module)
+    return missing
+
+
 def align_words(wav_path: Path, narration_text: str, *, model_size: str = "base.en",
                 language: str = "en") -> list[WordCue]:
     """Run faster-whisper on a single WAV and return one WordCue per token.
@@ -145,8 +161,11 @@ def align_words(wav_path: Path, narration_text: str, *, model_size: str = "base.
     """
     try:
         from faster_whisper import WhisperModel  # type: ignore
-    except ImportError:
-        logger.info("faster-whisper not installed; skipping word alignment")
+    except ImportError as exc:
+        # WARNING, not INFO: the caller uses this to decide whether to fall back to line-level
+        # captions. An INFO line here is how a published short shipped with no subtitles at all.
+        logger.warning("faster-whisper not installed (%s); word alignment unavailable — "
+                       "falling back to line-level captions", exc)
         return []
 
     if not wav_path.exists():
@@ -773,6 +792,54 @@ def _measure_button(draw, height: int, font_path: str, *, label: str = "SUBSCRIB
     return int(draw.textlength(label, font=font)) + int(height * 0.42) * 2
 
 
+def build_line_level_cues(
+    narration_text: str,
+    *,
+    segments: list[tuple[str, float, float]] | None = None,
+    audio_duration: float = 0.0,
+) -> list[GroupCue]:
+    """One caption per narration beat, timed against the rendered beat holds.
+
+    This is the fallback used when word alignment is unavailable (faster-whisper not installed,
+    model download blocked, alignment returned nothing). It is deliberately simpler than
+    word-synced captions: one strip per beat, held for the whole beat.
+
+    `segments` is (text, start_s, end_s) per spoken beat. When it is absent the narration text
+    is split into sentence-like lines and spread evenly across `audio_duration`, which still
+    yields readable subtitles instead of none.
+    """
+    if segments:
+        groups: list[GroupCue] = []
+        for text, start, end in segments:
+            words = tuple(WordCue(start=start, end=end, text=word)
+                          for word in str(text).split())
+            if not words:
+                continue
+            if audio_duration > 0:
+                end = min(end, audio_duration)
+                if start >= audio_duration:
+                    continue
+            groups.append(GroupCue(start=start, end=end, words=words))
+        return groups
+
+    # No beat timing: spread the lines across the track. Coarse, but subtitles beat silence.
+    lines = [line.strip() for line in re.split(r"(?<=[.!?])\s+", narration_text or "")
+             if line.strip()]
+    if not lines:
+        return []
+    total = audio_duration or 0.0
+    if total <= 0:
+        return []
+    span = total / len(lines)
+    groups = []
+    for i, line in enumerate(lines):
+        start = i * span
+        end = min((i + 1) * span, total)
+        words = tuple(WordCue(start=start, end=end, text=word) for word in line.split())
+        groups.append(GroupCue(start=start, end=end, words=words))
+    return groups
+
+
 def build_caption_overlays(
     wav_path: Path,
     narration_text: str,
@@ -786,17 +853,33 @@ def build_caption_overlays(
     long_word_ms: int = DEFAULT_LONG_WORD_MS,
     max_group: int = DEFAULT_MAX_GROUP,
     cta_block: tuple[str, float, float] | None = None,
+    segments: list[tuple[str, float, float]] | None = None,
 ) -> list[tuple[Path, float, float]]:
-    """End-to-end: align -> filter -> pack -> render. Returns [] on any failure.
+    """End-to-end: align -> filter -> pack -> render. Never returns empty when there is speech.
 
     `cta_block` is (text, start_s, end_s): the CTA is rendered as one static centred block with
     a subscribe button instead of word-synced groups, and any word group that falls inside that
     window is dropped so the two never overlap.
+
+    `segments` is (text, start_s, end_s) per spoken beat. It is only used by the line-level
+    fallback, which runs when word alignment is unavailable.
+
+    A published short with no subtitles is worse than one with coarse subtitles, so when word
+    alignment produces nothing the caller gets line-level captions instead of an empty list.
     """
     cues = align_words(wav_path, narration_text, model_size=whisper_model)
     cues = filter_usable_words(cues, audio_duration)
     if not cues:
-        return []
+        logger.warning("Word alignment produced no cues; using line-level captions instead")
+        groups = build_line_level_cues(
+            narration_text, segments=segments, audio_duration=audio_duration)
+        if not groups:
+            return []
+        overlays = render_group_pngs(
+            groups, out_dir, accent_palette=accent_palette, font_path=font_path)
+        if cta_block:
+            overlays = _apply_cta_block(overlays, cta_block, out_dir, font_path)
+        return overlays
     groups = pack_groups(
         cues,
         gap_tight_ms=gap_tight_ms,
@@ -822,15 +905,26 @@ def build_caption_overlays(
     )
 
     if cta_block:
-        cta_text, cta_start, cta_end = cta_block
-        # Drop word groups that overlap the CTA window; the block replaces them.
-        overlays = [(p, s, e) for (p, s, e) in overlays if e <= cta_start or s >= cta_end]
-        block_path = out_dir / "cta_block.png"
-        if render_cta_block(cta_text, block_path, font_path=font_path):
-            # "center" anchors the block to the middle of the frame, not the caption lane.
-            overlays.append((block_path, cta_start, cta_end, "center"))
+        overlays = _apply_cta_block(overlays, cta_block, out_dir, font_path)
 
     return overlays
+
+
+def _apply_cta_block(
+    overlays: list[tuple],
+    cta_block: tuple[str, float, float],
+    out_dir: Path,
+    font_path: str | None,
+) -> list[tuple]:
+    """Replace overlapping captions with one static centred CTA block."""
+    cta_text, cta_start, cta_end = cta_block
+    # Drop word groups that overlap the CTA window; the block replaces them.
+    kept = [(p, s, e) for (p, s, e) in overlays if e <= cta_start or s >= cta_end]
+    block_path = out_dir / "cta_block.png"
+    if render_cta_block(cta_text, block_path, font_path=font_path):
+        # "center" anchors the block to the middle of the frame, not the caption lane.
+        kept.append((block_path, cta_start, cta_end, "center"))
+    return kept
 
 
 __all__ = [
@@ -845,10 +939,12 @@ __all__ = [
     "WordCue",
     "align_words",
     "build_caption_overlays",
+    "build_line_level_cues",
     "classify_word",
     "filter_usable_words",
     "find_gaps",
     "is_hallucination_token",
+    "missing_caption_dependencies",
     "pack_groups",
     "render_cta_block",
     "render_group_pngs",

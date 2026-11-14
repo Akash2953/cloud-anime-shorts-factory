@@ -5,12 +5,17 @@ Pillow PNG rendering paths are exercised manually because they need faster-whisp
 installed; the deterministic packing logic is what fails most often during tuning.
 """
 
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from captions import (
     GroupCue,
     WordCue,
     _trim_trailing_hallucination,
+    build_caption_overlays,
+    build_line_level_cues,
     classify_word,
     filter_usable_words,
     find_gaps,
@@ -202,6 +207,95 @@ class TestGroupCueText(unittest.TestCase):
     def test_text_joins_with_space(self):
         g = GroupCue(start=0.0, end=0.5, words=(_w((0.0, 0.2, "she")), _w((0.2, 0.5, "ran"))))
         self.assertEqual(g.text, "she ran")
+
+
+class TestLineLevelFallback(unittest.TestCase):
+    """A short must never publish without subtitles just because alignment is unavailable.
+
+    The failure that shipped the caption-less video: faster-whisper was missing from the Python
+    that rendered it, so `align_words` returned [], `build_caption_overlays` returned [], and the
+    orchestrator rendered with `overlays=[]`. Nothing failed, nothing warned at ERROR level.
+    """
+
+    SEGMENTS = [
+        ("Rain hammers the sleeping city and the sky glows tonight.", 0.0, 6.8),
+        ("She pulls her hood up and lifts the lantern against the wind.", 6.8, 13.6),
+    ]
+
+    def test_one_cue_per_beat_with_the_beat_timing(self):
+        groups = build_line_level_cues(
+            " ".join(s[0] for s in self.SEGMENTS), segments=self.SEGMENTS, audio_duration=13.6)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual((groups[0].start, groups[0].end), (0.0, 6.8))
+        self.assertEqual((groups[1].start, groups[1].end), (6.8, 13.6))
+        self.assertTrue(groups[0].text.startswith("Rain hammers"))
+
+    def test_cues_are_clamped_to_the_track(self):
+        groups = build_line_level_cues(
+            "one beat only", segments=[("one beat only", 10.0, 99.0)], audio_duration=12.0)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0].end, 12.0)
+
+    def test_a_beat_starting_past_the_track_is_dropped(self):
+        groups = build_line_level_cues(
+            "late", segments=[("late", 20.0, 26.0)], audio_duration=12.0)
+        self.assertEqual(groups, [])
+
+    def test_without_beat_timing_the_text_is_spread_over_the_track(self):
+        groups = build_line_level_cues("First line here. Second line here.", audio_duration=10.0)
+        self.assertEqual(len(groups), 2)
+        self.assertAlmostEqual(groups[0].start, 0.0)
+        self.assertAlmostEqual(groups[0].end, 5.0)
+        self.assertAlmostEqual(groups[1].end, 10.0)
+
+    def test_no_timing_and_no_text_produces_nothing(self):
+        self.assertEqual(build_line_level_cues("", audio_duration=10.0), [])
+        self.assertEqual(build_line_level_cues("Some narration.", audio_duration=0.0), [])
+
+    def test_alignment_failure_falls_back_instead_of_returning_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            with patch("captions.align_words", return_value=[]), \
+                 patch("captions.render_group_pngs",
+                       return_value=[(out_dir / "cap_00.png", 0.0, 6.8)]) as render:
+                overlays = build_caption_overlays(
+                    Path("narration.wav"),
+                    " ".join(s[0] for s in self.SEGMENTS),
+                    audio_duration=13.6,
+                    out_dir=out_dir,
+                    segments=self.SEGMENTS,
+                )
+        self.assertEqual(len(overlays), 1)
+        render.assert_called_once()
+        rendered_groups = render.call_args[0][0]
+        self.assertEqual(len(rendered_groups), 2)
+
+    def test_missing_faster_whisper_logs_a_warning_not_info(self):
+        """INFO here is what made the broken run look healthy in the log."""
+        from captions import align_words
+        with patch.dict("sys.modules", {"faster_whisper": None}), \
+             self.assertLogs("captions", level="WARNING") as logs:
+            self.assertEqual(align_words(Path("nope.wav"), "text"), [])
+        self.assertTrue(any("line-level" in line for line in logs.output))
+
+    def test_a_video_with_narration_never_gets_zero_overlays(self):
+        """End-to-end guard on the regression itself: empty cues must not mean empty captions."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            with patch("captions.align_words", return_value=[]), \
+                 patch("captions._resolve_font", return_value=("", "none")), \
+                 patch("captions.render_group_pngs", return_value=[]):
+                # No font available is a genuine render failure and may stay empty.
+                self.assertEqual(build_caption_overlays(
+                    Path("n.wav"), "A line of narration.", audio_duration=5.0,
+                    out_dir=out_dir), [])
+            # With a font, the same missing alignment still yields overlays.
+            with patch("captions.align_words", return_value=[]), \
+                 patch("captions.render_group_pngs",
+                       return_value=[(out_dir / "cap_00.png", 0.0, 5.0)]):
+                overlays = build_caption_overlays(
+                    Path("n.wav"), "A line of narration.", audio_duration=5.0, out_dir=out_dir)
+            self.assertEqual(len(overlays), 1)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from cta import CTA_LAST, CTA_MIDDLE, CTA_SINGLE, cta_line, cta_shot
-from scenes import Shot, fallback_title, parse_title
+from orchestrator import story_title
+from scenes import Shot, fallback_title, parse_title, title_from_line
 from thumbnail import THUMB_HEIGHT, THUMB_WIDTH, pick_key_frame, render_thumbnail
 
 
@@ -67,6 +68,48 @@ class TestStoryTitle(unittest.TestCase):
 
     def test_fallback_title_with_no_speech(self):
         self.assertEqual(fallback_title([_shot(narration="none")]), "")
+
+    def test_planner_title_ending_on_a_conjunction_is_rejected(self):
+        # A cut sentence is not a name: fall through to a title built from the narration.
+        self.assertEqual(parse_title("Title: Rain drummed on the tin roof while"), "")
+        self.assertEqual(parse_title("Title: of"), "")
+        self.assertEqual(parse_title("Title: The Girl Who Waited Because"), "")
+
+    def test_a_real_title_still_parses(self):
+        self.assertEqual(parse_title("Title: The Lantern That Remembered"),
+                         "The Lantern That Remembered")
+
+    def test_fallback_title_never_ends_mid_clause(self):
+        # The regression: this uploaded as "Rain drummed on the tin roof while".
+        shots = [_shot(narration="Rain drummed on the tin roof while the city slept, and Mio "
+                                 "wiped fresh oil from her fingers.")]
+        self.assertEqual(fallback_title(shots), "Rain drummed on the tin roof")
+
+    def test_fallback_title_skips_a_clause_that_cannot_stand_alone(self):
+        shots = [_shot(narration="And then, because she had promised, the bell rang.")]
+        self.assertEqual(fallback_title(shots), "the bell rang")
+
+
+class TestStoryTitleFromState(unittest.TestCase):
+    """`story_title` is the second fallback — it names the upload from the plan in state.json."""
+
+    def test_series_title_wins(self):
+        state = {"series": {"title": "The Lantern That Remembered", "parts": []}}
+        self.assertEqual(story_title(state), "The Lantern That Remembered")
+
+    def test_missing_title_falls_back_to_a_complete_phrase(self):
+        state = {"series": {"title": "", "parts": [[
+            {"narration": "Rain drummed on the tin roof while the city slept."}]]}}
+        self.assertEqual(story_title(state), "Rain drummed on the tin roof")
+
+    def test_nothing_usable_is_untitled(self):
+        state = {"series": {"title": "", "parts": [[{"narration": "none"}]]}}
+        self.assertEqual(story_title(state), "Untitled Story")
+
+    def test_title_from_line_rejects_pure_fragments(self):
+        self.assertEqual(title_from_line(""), "")
+        self.assertEqual(title_from_line("and"), "")
+        self.assertEqual(title_from_line("the of at"), "")
 
 
 class TestThumbnail(unittest.TestCase):

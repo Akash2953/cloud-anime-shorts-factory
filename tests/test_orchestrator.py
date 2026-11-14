@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from orchestrator import advance_series, beat_track, resolve_part
+from orchestrator import advance_series, beat_track, caption_preflight, resolve_part
 from scenes import Shot, _template_shots
 
 CFG = {
@@ -307,6 +307,35 @@ class TestAdvanceSeries(unittest.TestCase):
         state = {"processed": [], "daily": {}}
         advance_series(state, 1)
         self.assertNotIn("series", state)
+
+
+class TestCaptionPreflight(unittest.TestCase):
+    """The run must say out loud when its interpreter cannot produce subtitles."""
+
+    def test_a_healthy_interpreter_is_quiet(self):
+        with patch("captions.missing_caption_dependencies", return_value=[]), \
+             self.assertNoLogs("orchestrator", level="WARNING"):
+            caption_preflight({"WORD_CAPTIONS": True})
+
+    def test_missing_faster_whisper_warns_with_the_interpreter_and_the_fix(self):
+        with patch("captions.missing_caption_dependencies", return_value=["faster_whisper"]), \
+             self.assertLogs("orchestrator", level="WARNING") as logs:
+            caption_preflight({"WORD_CAPTIONS": True})
+        text = "\n".join(logs.output)
+        self.assertIn("faster_whisper", text)
+        self.assertIn("requirements.txt", text)
+        self.assertIn("line per beat", text)
+
+    def test_missing_pillow_is_an_error_because_no_subtitles_can_render(self):
+        with patch("captions.missing_caption_dependencies", return_value=["PIL"]), \
+             self.assertLogs("orchestrator", level="ERROR") as logs:
+            caption_preflight({"WORD_CAPTIONS": True})
+        self.assertIn("WITHOUT subtitles", "\n".join(logs.output))
+
+    def test_captions_disabled_skips_the_check(self):
+        with patch("captions.missing_caption_dependencies") as check:
+            caption_preflight({"WORD_CAPTIONS": False})
+        check.assert_not_called()
 
 
 if __name__ == "__main__":

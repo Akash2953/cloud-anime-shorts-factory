@@ -4,7 +4,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from story import MAX_PARTS
+from antigravity_oauth import ANTIGRAVITY_OAUTH_CREDENTIAL
+from scenes import MAX_PARTS
 
 
 def load_dotenv(path: Path = Path(".env")) -> None:
@@ -87,6 +88,13 @@ def _series_parts(raw: str | None) -> int | str:
 
 def load_config() -> dict:
     load_dotenv()
+    antigravity_access = os.environ.get("ANTIGRAVITY_ACCESS_TOKEN", "").strip()
+    antigravity_refresh = os.environ.get("ANTIGRAVITY_REFRESH_TOKEN", "").strip()
+    antigravity_api_key = (
+        os.environ.get("ANTIGRAVITY_API_KEY", "").strip()
+        or antigravity_access
+        or (ANTIGRAVITY_OAUTH_CREDENTIAL if antigravity_refresh else "")
+    )
     return {
         "CFAI_TOKEN": os.environ.get("CFAI_TOKEN", ""),
         # Cloudflare account ID for Workers AI. R2_ACCOUNT_ID kept as a fallback
@@ -97,6 +105,16 @@ def load_config() -> dict:
         "YOUTUBE_REFRESH_TOKEN": os.environ.get("YOUTUBE_REFRESH_TOKEN", ""),
         # private until you trust the output; set to "public" for hands-off publishing.
         "PUBLISH_PRIVACY": os.environ.get("PUBLISH_PRIVACY", "private").lower(),
+        # The sentinel selects the OAuth refresh flow without exposing the refresh token to
+        # provider-selection code. A supplied access token or API key is used directly.
+        "ANTIGRAVITY_API_KEY": antigravity_api_key,
+        # Optional access token when the caller already has a fresh one (avoids a
+        # refresh round-trip). Set alongside ANTIGRAVITY_REFRESH_TOKEN or on its own.
+        "ANTIGRAVITY_ACCESS_TOKEN": antigravity_access,
+        "ANTIGRAVITY_REFRESH_TOKEN": antigravity_refresh,
+        "ANTIGRAVITY_OAUTH_CLIENT_ID": os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_ID", ""),
+        "ANTIGRAVITY_OAUTH_CLIENT_SECRET": os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_SECRET", ""),
+        "ANTIGRAVITY_PROJECT_ID": os.environ.get("ANTIGRAVITY_PROJECT_ID", ""),
         "OPENROUTER_API_KEY": os.environ.get("OPENROUTER_API_KEY", ""),
         # Optional local gateway (OmniRoute). Not used by the daily pipeline today.
         "OMNIROUTE_API_KEY": os.environ.get("OMNIROUTE_API_KEY", ""),
@@ -155,4 +173,7 @@ def load_config() -> dict:
         # loudness stages still run. MUSIC_SEED varies the bed's texture between runs.
         "MUSIC_ENABLED": os.environ.get("MUSIC_ENABLED", "true").lower() == "true",
         "MUSIC_SEED": _as_int(os.environ.get("MUSIC_SEED"), 0xC001),
+        # Delete frames/captions/audio/MP4 once the upload succeeds. Off keeps them for a manual
+        # re-render (`--reuse-frames`); on, a run leaves nothing behind but the video on YouTube.
+        "CLEANUP_AFTER_UPLOAD": os.environ.get("CLEANUP_AFTER_UPLOAD", "true").lower() == "true",
     }
