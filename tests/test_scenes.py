@@ -8,10 +8,11 @@ image prompt (a leading character paragraph collapsed every frame into a portrai
 import unittest
 
 from scenes import (
-    NARRATIVE_ROLES, SHOT_SIZES, STYLE, Shot, _infer_character, _template_shots,
-    anchor_prompt, fit_shot_count, make_character, parse_detailed_response, parse_plan,
-    plan_shots, _spoken_words, reuse_image_refs, shots_for_duration, unique_prompts,
-    words_for_duration,
+    HOOK_MAX_WORDS, NARRATIVE_ROLES, SHOT_SIZES, STYLE, Shot, _hook_problem, _infer_character,
+    _opens_with, _plan_gaps, _spoken_words, _template_shots, _total_spoken_words, anchor_prompt,
+    fit_shot_count,
+    make_character, parse_detailed_response, parse_hook, parse_plan, plan_shots, reuse_image_refs,
+    shots_for_duration, unique_prompts, words_for_duration,
 )
 
 # The signature is now a per-arc value, not a global. Tests pin one value so the
@@ -298,7 +299,9 @@ def detailed_reply(n: int, *, complete: bool = True) -> str:
     Complete by default (every field the prompt contract asks for, plus an `Arc:` line), so the
     repair loop stays out of the way unless a test is specifically about a missing detail.
     """
-    blocks = [f"Arc: 1 part\nShort 1: {n} shots, {n} images.\n"]
+    header = (f"Arc: 1 part\nHook: \"She crosses the flooded walkway and counts the lanterns "
+              f"above her.\"\nShort 1: {n} shots, {n} images.\n")
+    blocks = [header]
     for i in range(1, n + 1):
         extra = ("- Place: a flooded walkway\n- Story object: a paper lantern\n"
                  "- Narrative role: build_tension\n- Audio notes: rain\n- Transition: cut\n"
@@ -605,6 +608,99 @@ class TestProviderErrors(unittest.TestCase):
         self.assertEqual(_classify(429, "anything"), "quota_exhausted")
         self.assertEqual(_classify(503, str(self.QUOTA_BODY)), "quota_exhausted")
         self.assertEqual(_classify(401, "nope"), "auth_401")
+
+
+class TestOpeningHook(unittest.TestCase):
+    """The first spoken line decides whether the rest of the short is watched at all.
+
+    These pin the two failure modes that shipped: a hook framed as setup ("once upon a time") and a
+    stated hook that the opening shot does not actually speak, leaving a weather description as the
+    first thing a viewer hears.
+    """
+
+    GOOD = ("In Oakhaven memories are currency, and Kael just found one that wasn't.")
+
+    def test_hook_is_read_from_its_own_line(self):
+        reply = f'Hook: "{self.GOOD}"\nTitle: The Memory Thief\n'
+        self.assertEqual(parse_hook(reply), self.GOOD)
+
+    def test_markdown_and_single_quotes_are_tolerated(self):
+        self.assertEqual(parse_hook(f"**Hook:** '{self.GOOD}'"), self.GOOD)
+        self.assertEqual(parse_hook(f"- Hook = {self.GOOD}"), self.GOOD)
+
+    def test_prose_about_hooks_is_not_a_hook_line(self):
+        self.assertEqual(parse_hook("The last shot must end on a hook, never a resolution."), "")
+        self.assertEqual(parse_hook("Short 1: 8 shots, 8 images."), "")
+
+    def test_setup_openers_are_rejected(self):
+        for opener in ("Once upon a time, in a far village, a boy waited.",
+                       "In a world where memories are sold, one boy refused.",
+                       "Have you ever wondered what a memory is worth to you?",
+                       "This is a story about a boy who sold his memories."):
+            self.assertTrue(_hook_problem(opener), opener)
+
+    def test_a_story_of_frame_survives_when_it_carries_the_cost(self):
+        self.assertEqual(_hook_problem(
+            "This is the story of a boy who sold memories and forgot his own sister."), "")
+
+    def test_length_band_is_enforced_both_ways(self):
+        self.assertIn("words", _hook_problem("Kael sells memories."))
+        long = " ".join(["Kael"] * (HOOK_MAX_WORDS + 1))
+        self.assertIn("too long", _hook_problem(long))
+        self.assertEqual(_hook_problem(self.GOOD), "")
+
+    def test_shot_one_must_speak_the_stated_hook(self):
+        hook = self.GOOD
+        self.assertTrue(_opens_with(hook.lower() + " He did not know it yet.", hook))
+        self.assertFalse(_opens_with(
+            "The mist clung to the rooftops when Kael arrived, vials singing.", hook))
+
+    def test_a_hook_the_opening_shot_ignores_is_a_gap(self):
+        reply = detailed_reply(2).replace(
+            'Hook: "She crosses the flooded walkway and counts the lanterns above her."',
+            f'Hook: "{self.GOOD}"'
+        ).replace('- Narration: "She crosses',
+                  '- Narration: "The mist clung to the roofs and she crosses', 1)
+        shots, prompts = parse_detailed_response(reply)
+        gaps = _plan_gaps(reply, shots, prompts, want=2)
+        joined = " | ".join(gaps)
+        self.assertIn("does not open with the Hook", joined)
+        self.assertIn("The mist clung", joined)
+
+    def test_a_missing_hook_line_is_a_gap(self):
+        reply = detailed_reply(4).replace(
+            'Hook: "She crosses the flooded walkway and counts the lanterns above her."\n', "")
+        shots, prompts = parse_detailed_response(reply)
+        gaps = _plan_gaps(reply, shots, prompts, want=4)
+        self.assertTrue(any("`Hook:` line is missing" in gap for gap in gaps), gaps)
+
+
+class TestWordCeiling(unittest.TestCase):
+    """Speech is read at a fixed pace, so the word count is the runtime.
+
+    The renderer extends the video instead of speeding the narrator up, which makes an over-long
+    plan a planning problem: it has to be caught here, in words, before any audio is made.
+    """
+
+    def long_plan(self, n: int = 8, words: int = 30) -> list[Shot]:
+        line = " ".join(["word"] * words) + "."
+        return [Shot(narration=line, shot_size="wide", place=f"place {i}", action="she waits",
+                     story_object="no object", narrative_role="build_tension",
+                     image_prompt_ref=i) for i in range(1, n + 1)]
+
+    def test_a_plan_past_the_ceiling_is_a_gap(self):
+        reply = detailed_reply(4)
+        shots, prompts = parse_detailed_response(reply)
+        gaps = _plan_gaps(reply, shots, prompts, want=4, max_words=40)
+        self.assertTrue(any("carries at most 40" in gap for gap in gaps), gaps)
+
+    def test_a_plan_inside_the_ceiling_is_not(self):
+        reply = detailed_reply(4)
+        shots, prompts = parse_detailed_response(reply)
+        self.assertEqual(_plan_gaps(reply, shots, prompts, want=4, max_words=400), [])
+
+    def test_the_total_is_what_is_measured_not_the_average(self):
+        self.assertEqual(_total_spoken_words(self.long_plan(3, 10)), 30)
 
 
 class TestOfflineFallback(unittest.TestCase):

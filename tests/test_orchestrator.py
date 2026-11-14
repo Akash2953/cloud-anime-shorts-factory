@@ -11,7 +11,7 @@ from unittest.mock import patch
 import numpy as np
 
 from orchestrator import advance_series, beat_track, caption_preflight, resolve_part
-from scenes import Shot, _template_shots
+from scenes import Shot, _template_shots, words_for_duration
 
 CFG = {
     "CFAI_TOKEN": "token", "CF_ACCOUNT_ID": "account", "OPENROUTER_API_KEY": "key",
@@ -278,6 +278,17 @@ class TestResolvePart(unittest.TestCase):
         self.assertEqual(len(shots), 13)
         self.assertEqual((part, total), (1, 1))
         self.assertNotIn("series", out)
+
+    def test_the_planner_gets_a_word_ceiling_derived_from_max_seconds(self):
+        # Speech is never time-scaled, so the ceiling is what keeps a plan from outrunning the
+        # short: MAX_SECONDS minus the breaths and the tail hold, converted at the fixed pace.
+        state = {"processed": [], "daily": {}}
+        with patch("orchestrator.plan_shorts_detailed",
+                   return_value=(plan(8), {}, False, 1)) as planner:
+            resolve_part(CFG, state)
+        ceiling = planner.call_args.kwargs["max_words"]
+        self.assertGreaterEqual(ceiling, 180)          # 8 shots, 75 s window
+        self.assertLess(ceiling, words_for_duration(75))
 
     def test_shot_count_follows_the_pacing_window(self):
         state = {"processed": [], "daily": {}}

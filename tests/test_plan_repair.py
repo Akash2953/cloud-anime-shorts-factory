@@ -34,6 +34,30 @@ class TestIncompletePlanRepair(unittest.TestCase):
         self.assertEqual(len(shots), 8)
         self.assertFalse(fallback)
 
+    def test_a_missing_hook_line_is_repaired(self):
+        no_hook = detailed_reply(8).replace(
+            'Hook: "She crosses the flooded walkway and counts the lanterns above her."', "")
+        (_shots, _prompts, _fallback, _arc, _title), planner = self.plan(
+            [no_hook, detailed_reply(8)], want=8)
+        self.assertEqual(planner.call_count, 2)
+        self.assertIn("`Hook:` line is missing", planner.call_args[0][0][-1]["content"])
+
+    def test_a_hook_the_opening_shot_ignores_is_repaired(self):
+        # The shipped failure: the planner stated a hook, then opened the short on weather.
+        scenery = detailed_reply(8).replace(
+            '- Narration: "She crosses', '- Narration: "The mist clung to the roofs and she crosses', 1)
+        (_shots, _prompts, fallback, _arc, _title), planner = self.plan(
+            [scenery, detailed_reply(8)], want=8)
+        self.assertEqual(planner.call_count, 2)
+        self.assertIn("does not open with the Hook", planner.call_args[0][0][-1]["content"])
+        self.assertFalse(fallback)
+
+    def test_an_over_long_script_is_repaired_against_the_word_ceiling(self):
+        (_shots, _prompts, _fallback, _arc, _title), planner = self.plan(
+            [detailed_reply(8), detailed_reply(8)], want=8, max_words=120)
+        self.assertEqual(planner.call_count, 2)
+        self.assertIn("carries at most 120", planner.call_args[0][0][-1]["content"])
+
     def test_a_missing_image_prompt_is_named_in_the_repair_request(self):
         broken = detailed_reply(8).replace(f"Image 5: scene 5 in the rain.{NL}", "")
         (_shots, _prompts, _fallback, _arc, _title), planner = self.plan(

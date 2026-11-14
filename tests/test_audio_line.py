@@ -115,10 +115,10 @@ class TestNarrationLine(unittest.TestCase):
         make_narration(kokoro).line("hello", voice="af_bella", speed=1.15)
         self.assertEqual(kokoro.requests[0][1], "af_bella")
 
-    def test_synth_scaled_uses_the_guard(self):
-        kokoro = ScriptedKokoro(fail_texts={"broken middle line"})
-        with self.assertRaises(AudioLineError):
-            make_narration(kokoro).synth_scaled(["fine line", "broken middle line"], 6.0)
+    def test_there_is_no_time_scaling_path(self):
+        # Pacing is a product rule, not a tuning knob: the pipeline extends the video instead, so
+        # a helper that compresses the read must not exist to be called again by accident.
+        self.assertFalse(hasattr(make_narration(ScriptedKokoro()), "synth_scaled"))
 
 
 class TestPipelineAbortsOnAMissingLine(unittest.TestCase):

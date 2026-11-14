@@ -27,7 +27,7 @@ from render import render_narration
 # have faster-whisper installed shouldn't pay its import cost on startup.
 from scenes import (MAX_PARTS, Shot, make_character, plan_arc, plan_shorts_detailed,
                     reuse_image_refs, shots_for_duration, title_from_line, unique_prompts,
-                    validate_story_position)
+                    validate_story_position, words_for_duration)
 from state import compute_fingerprint, parse_state, save_state, today_key
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
@@ -131,6 +131,15 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None,
     target_seconds = float(cfg.get("PREFERRED_SECONDS")
                            or (cfg["MIN_SECONDS"] + cfg["MAX_SECONDS"]) // 2)
     want = int(cfg.get("SHOTS_PER_PART") or shots_for_duration(target_seconds))
+    # Speech is never time-scaled, so the word count IS the runtime. A plan that would read past
+    # MAX_SECONDS is asked for again with this ceiling rather than compressed at the microphone:
+    # the overhead is the breaths between lines, the tail hold and the CTA beat.
+    overhead = BEAT_GAP * (want - 1) + TAIL_HOLD
+    cta_seconds = float(cfg.get("CTA_SECONDS") or 0)
+    if cta_seconds:
+        overhead += cta_seconds + BEAT_GAP
+    max_words = words_for_duration(
+        max(20.0, float(cfg.get("MAX_SECONDS") or 75) - overhead))
     part_number = index + 1
     # Each arc draws its own protagonist, fixed for the whole arc. A new story (index 0) gets a
     # signature seeded from today's id; an in-flight continuation keeps the one it opened with.
@@ -151,7 +160,7 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None,
     plan_result = plan_shorts_detailed(
         theme="", character=character, api_key=cfg.get("OPENROUTER_API_KEY", ""),
         gemini_key=cfg.get("ANTIGRAVITY_API_KEY", ""),
-        want=want, target_seconds=target_seconds,
+        want=want, target_seconds=target_seconds, max_words=max_words,
         part=part_number, total_parts=None if decide_arc else total_parts,
         story_so_far=story_so_far,
         parts_range=(int(cfg.get("PARTS_MIN") or 1), int(cfg.get("PARTS_MAX") or MAX_PARTS)),
@@ -390,14 +399,13 @@ def run_pipeline(*, render_only: bool = False,
     # Only spoken beats are synthesised; the silent ones become their planned hold.
     story_positions = [p for p, i in enumerate(spoken) if i != cta_index]
     story_texts = [speech[spoken[p]] for p in story_positions]
-    cta_hold = len(cta_audio) / SAMPLE_RATE if cta_audio is not None else 0.0
-    budget = (target_seconds - BEAT_GAP * (len(shots) - 1) - TAIL_HOLD - silent_hold
-              - cta_hold)
     try:
-        raw = [narration_tts.line(t, label=f"beat {spoken[p] + 1}")
-               for p, t in zip(story_positions, story_texts)]
-        scaled_story, speed = (narration_tts.synth_scaled(story_texts, target_seconds=budget)
-                               if story_texts else ([], 1.0))
+        # Natural pace, always, in every shot and every part. There is no time-scaling pass: a
+        # script that runs long makes the video longer (the stills are held for their own lines),
+        # because a sped-up read is not understandable to a viewer whose first language is not
+        # English — and that audience is most of a Shorts feed.
+        story_audio = [narration_tts.line(t, label=f"beat {spoken[p] + 1}")
+                       for p, t in zip(story_positions, story_texts)]
     except AudioLineError as exc:
         # A missing line cannot be patched downstream: abort before spending the render, leave
         # the queue untouched so tomorrow retries the same part.
@@ -405,32 +413,37 @@ def run_pipeline(*, render_only: bool = False,
         return
 
     # Rebuild the per-beat segment list in `spoken` order, splicing the CTA back in.
-    scaled: list[np.ndarray] = []
-    story_iter = iter(scaled_story)
+    voiced: list[np.ndarray] = []
+    story_iter = iter(story_audio)
     for i in spoken:
-        scaled.append(cta_audio if i == cta_index else next(story_iter))
-    if len(scaled) != len(spoken):
+        voiced.append(cta_audio if i == cta_index else next(story_iter))
+    if len(voiced) != len(spoken):
         logger.error("Narration produced %d segment(s) for %d spoken beat(s); aborting",
-                     len(scaled), len(spoken))
+                     len(voiced), len(spoken))
         return
-    natural = sum(len(a) for a in scaled) / SAMPLE_RATE
 
-    beats, audio, durations = beat_track(shots, scaled)
+    beats, audio, durations = beat_track(shots, voiced)
     if not len(audio):
         logger.error("Narration track is empty; aborting before render")
         return
     total = sum(durations)
     speech_duration = sum(len(b) for b in beats) / SAMPLE_RATE
-    # seconds of audio per second of video: must stay ~1.0, so a >6 reading means real drift.
-    cut_rate = (len(audio) / SAMPLE_RATE) / total if total else 999
-    logger.info("Natural speech %.1fs; scaled by %.2f -> %.1fs speech, %.1fs total",
-                natural, speed, speech_duration, total)
 
-    if speed < 0.6 or cut_rate > 6:
-        logger.warning("Speech scaling too extreme (%.2fx); using the natural read", speed)
-        beats, audio, durations = beat_track(shots, raw)
-        total = sum(durations)
-        speed = 1.0
+    # The runtime is the read, not a target. Warn when it drifts past the planned window (the
+    # planner was asked for a smaller word budget and did not meet it), and refuse only when the
+    # result would no longer be a Short at all — never by speeding the narrator up.
+    hard_max = float(cfg.get("HARD_MAX_SECONDS") or 175)
+    if total > hard_max:
+        logger.error("Narration runs %.1fs at the natural pace, past the %.0fs hard limit for a "
+                     "Short. Refusing to speed up the narrator or upload a non-Short; queue "
+                     "untouched — lower the word budget or raise SERIES_PARTS.", total, hard_max)
+        return
+    if total > float(cfg.get("MAX_SECONDS") or 75):
+        logger.warning("Natural read gives %.1fs, past the %.0fs planning ceiling: the video is "
+                       "extended rather than compressed",
+                       total, float(cfg.get("MAX_SECONDS") or 75))
+    logger.info("Narration %.1fs at natural pace (planned %.0fs), video %.1fs, %.1fs per cut",
+                speech_duration, target_seconds, total, total / max(1, len(shots)))
 
     audio_path = Path("build/narration.wav")
     write_wav(audio_path, audio)

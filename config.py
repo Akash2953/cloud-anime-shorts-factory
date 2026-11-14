@@ -131,11 +131,16 @@ def load_config() -> dict:
         "MAX_IMAGE_ATTEMPTS": os.environ.get("MAX_IMAGE_ATTEMPTS") or 16,
         # Image strategy: edit (canonical + conditioned edits) | sheet (one sheet, cropped) | fresh
         "IMAGE_STRATEGY": os.environ.get("IMAGE_STRATEGY", "edit"),
-        # Runtime is emergent, not fixed: speech is only re-timed to land inside this window.
-        # Narration is read aloud at ~158 wpm: a 55s short carries ~145 words of story. Too short
-        # a window forces the narrator to speed up, which is what made the earlier shorts clip.
+        # Speech is NEVER time-scaled. The narrator is read at Kokoro's natural pace, every line of
+        # every part, because a rushed read is unreadable for viewers whose first language is not
+        # English. A longer script therefore extends the video instead of compressing the voice:
+        # MAX_SECONDS is a *planning* ceiling (a plan that would render past it is re-asked with a
+        # smaller word budget), not a render constraint. PREFERRED_SECONDS only sizes the plan.
         "MIN_SECONDS": float(os.environ.get("MIN_SECONDS", 45)),
         "MAX_SECONDS": float(os.environ.get("MAX_SECONDS", 75)),
+        # Past this the video is no longer a Short (YouTube's ceiling is 180s). The run refuses to
+        # upload rather than speed the narrator up or publish a non-Short; the part stays queued.
+        "HARD_MAX_SECONDS": float(os.environ.get("HARD_MAX_SECONDS", "175")),
         # How many shorts a story spans, one uploaded per day: an int, or "auto" to let the
         # planner choose the arc length per story (stated once, then pinned in state.json).
         "SERIES_PARTS": _series_parts(os.environ.get("SERIES_PARTS")),

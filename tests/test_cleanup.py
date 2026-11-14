@@ -105,7 +105,6 @@ class TestPipelineCleanup(unittest.TestCase):
         tone = np.full(int(1.0 * SAMPLE_RATE), 0.1, dtype=np.float32)
         narration = MagicMock()
         narration.line.return_value = tone
-        narration.synth_scaled.return_value = ([tone] * len(shots), 1.0)
 
         def fake_render(frames, durations, audio, out, **kwargs):
             Path(out).write_bytes(b"v" * 500)      # the render step really writes the MP4

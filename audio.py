@@ -171,52 +171,6 @@ class Narration:
                     time.sleep(backoff_s * attempt)
         raise AudioLineError(f"{what}: no usable audio after {attempts} attempts ({last})")
 
-    def synth_scaled(
-        self, lines: list[str], target_seconds: float, *, iterations: int = 4, tol: float = 0.02
-    ) -> tuple[list[np.ndarray], float]:
-        """Fit the speaking rate to `target_seconds` by bisection.
-
-        A single ratio (measured/target) overshoots, because Kokoro's fixed pauses make
-        duration non-monotone in `speed`. Bisection on a monotone-decreasing assumption
-        converges in a few passes and keeps the best candidate seen.
-        """
-        segments = [self.line(line, label=f"line {i}") for i, line in enumerate(lines, 1)]
-        speed = self.speed
-        if target_seconds <= 0 or not segments:
-            return segments, speed
-
-        measured = sum(len(a) for a in segments) / SAMPLE_RATE
-        logger.info("Pass 0: %.2fs at speed %.2f (target %.2fs)", measured, speed, target_seconds)
-        if abs(measured - target_seconds) / target_seconds <= tol:
-            return segments, speed
-
-        best = (abs(measured - target_seconds), speed, segments)
-        lo, hi = 0.7, 1.5
-        # Faster speech is shorter, so measured > target means search higher.
-        if measured > target_seconds:
-            lo = self.speed
-        else:
-            hi = self.speed
-
-        for attempt in range(1, iterations + 1):
-            speed = round((lo + hi) / 2, 3)
-            candidate = [self.line(line, speed=speed, label=f"line {i}")
-                         for i, line in enumerate(lines, 1)]
-            measured = sum(len(a) for a in candidate) / SAMPLE_RATE
-            error = abs(measured - target_seconds)
-            logger.info("Pass %d: %.2fs at speed %.3f (error %.1f%%)",
-                        attempt, measured, speed, error / target_seconds * 100)
-            if error < best[0]:
-                best = (error, speed, candidate)
-            if error / target_seconds <= tol:
-                break
-            if measured > target_seconds:
-                lo = speed
-            else:
-                hi = speed
-
-        return best[2], best[1]
-
 
 def write_wav(path: Path, audio: np.ndarray) -> Path:
     import soundfile as sf

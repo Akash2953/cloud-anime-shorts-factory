@@ -134,19 +134,15 @@ def main() -> int:
     beats = [s.narration for s in shots]
     gaps = GAP * (len(beats) - 1)
     narration = Narration(voice=cfg["KOKORO_VOICE"])
-    raw = [narration.wav(b) for b in beats]
-    natural = sum(len(a) for a in raw) / SAMPLE_RATE
-    ceiling = MAX_SECONDS - gaps - 0.6
-    if natural <= ceiling:
-        segments, speed = raw, 1.0
-    else:
-        segments, speed = narration.synth_scaled(beats, target_seconds=ceiling)
+    # Natural pace, never time-scaled: the pipeline extends the video instead of compressing the
+    # read, so this check has to measure the same thing the render will.
+    segments = [narration.wav(b) for b in beats]
     speech = sum(len(s) for s in segments) / SAMPLE_RATE
     audio, starts = join_with_gaps(segments, gap_seconds=GAP)
     audio_path = write_wav(BUILD / "narration_check.wav", audio)
     cut_rate = (speech + gaps) / len(beats)
-    record("narration", speed >= 0.6 and 1.5 <= cut_rate <= 6.0,
-           f"{speech:.2f}s speech, speed {speed:.2f}, ~{cut_rate:.1f}s per cut over {len(beats)} cuts")
+    record("narration", 1.5 <= cut_rate <= 6.0,
+           f"{speech:.2f}s speech at natural pace, ~{cut_rate:.1f}s per cut over {len(beats)} cuts")
 
     # 4. Render ---------------------------------------------------------------
     durations = [len(s) / SAMPLE_RATE + GAP for s in segments]

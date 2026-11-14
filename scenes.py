@@ -162,6 +162,11 @@ or consequence that the frame cannot show. Write full sentences, with the charac
 clearly referred to, and use linking words (and, but, so, until, because, then) where the story
 needs them. One word sentences, labels, slogans and noun stacks are forbidden: "Gold eyes.
 Targeting." is not narration, it is a caption.
+- **Place changes are spoken.** When a shot's `Place` is not the one before it, the first clause of
+that shot's Narration carries the move — "By the time he reached the Spire", "Back at the shrine,
+the rain had stopped", "Inside, the machine was already awake". Fuse the move into the sentence
+that does the story work; never spend a whole line announcing a location ("Later, at the
+temple.") — that is padding, and it describes what the frame already shows.
 
 **Per Shot output format (one entry per shot, in order):**
 
@@ -176,7 +181,7 @@ Shot N:
 - Narrative role: <establish_context|introduce_subject|build_tension|deliver_payload|emotional_beat|evidence|resolution|call_to_action>
 - Visual description: <what appears on screen>
 - Action: <action taking place>
-- Narration: "<2-3 full sentences of connected prose: what she does, what it costs her, what she has just understood>"     (or "none" if silent)
+- Narration: "<2-3 full sentences of connected prose: what she does, what it costs her, what she has just understood>"     (or "none" if silent; Shot 1's Narration must begin with the Hook sentence, word for word)
 - Audio notes: "<music/SFX/ambient or silence>"
 - Transition: <cut|fade|dissolve>
 - Image prompt ref: Image N
@@ -184,13 +189,44 @@ Shot N:
 
 Begin with a count line: "Short 1: N shots, M images."
 
+**Before the title and the count line, state the Hook:**
+```
+Hook: "<one spoken sentence, 10-16 words>"
+```
+The Hook is the first thing the narrator says, so it is the first sentence of Shot 1's Narration,
+word for word. It has one job: a stranger scrolling past, who has never seen this story, has to
+need the next ten seconds. Ten to sixteen words. Build it out of the story's own world — who, what
+is wrong here, and what it will cost — and leave one of those three unresolved. The hook is not a
+summary, a genre label, or a title read aloud.
+
+Its shape is: a person, in this story's place, against one broken rule or one price — stated as a
+flat fact, not as a question, a greeting or a scene-setting description. Shot 1 is that sentence
+plus at most one short clause of consequence; it still has to fit the per-line word budget this
+request sets. Write a new hook for this story: never reuse a line, name or place from an earlier
+story, and never copy the shape of these failures as if it were a template.
+
+- Fails: "Once upon a time, in a faraway village, there lived a boy named Kael." (setup, no gap)
+- Fails: "The mist clung to the rooftops when Kael arrived." (weather and scenery first)
+- Fails: "Have you ever wondered what your memories are worth?" (a question defers the payoff)
+
+A "This is the story of…" frame is allowed, but only when the words after it already carry the
+contradiction or the cost — a boy who sold memories and forgot his own sister — never a bare
+name, and never as the whole of the hook's content.
+
 **Before the count line, state the story's name:**
 ```
 Title: <3-7 words, the story's own name, no date, no "Anime Short", no part number>
 ```
 The title is what the video is published as, so it must name this story ("The Lantern She
 Left Burning"), not describe the format. Do not put "Part 1" in it — the publisher adds the
-part number itself.
+part number itself. The title is not spoken: it is the upload title, the thumbnail and the
+channel grid, so the narrator never spends opening words announcing it.
+
+**Shot 1 is the hook frame.** It carries the Hook sentence, so it must be the most arresting
+frame in the plan — the protagonist's face mid-emotion, or the story object doing the impossible
+thing — at medium, medium close or close. Never open on an establishing view, a skyline or an
+empty street, however atmospheric: a wide view of a place nobody has been introduced to yet is
+the sound of a thumb moving to the next video.
 
 **After all shots, add this section header exactly:**
 ```
@@ -486,12 +522,14 @@ def _ranges(numbers: list[int]) -> str:
 
 
 def _plan_gaps(text: str, shots: list[Shot], image_prompts: dict[int, str], *,
-               want: int = 0, need_arc: bool = False) -> list[str]:
+               want: int = 0, need_arc: bool = False, hook_required: bool = True,
+               max_words: int = 0) -> list[str]:
     """What the planner left out of its reply, phrased as repair instructions.
 
     Anything listed here is detail the pipeline would otherwise silently invent its own answer
-    for — a missing image prompt, a missing field per shot, an undeclared arc length, or narration
-    written as captions instead of prose.
+    for — a missing image prompt, a missing field per shot, an undeclared arc length, a hook the
+    opening shot does not actually speak, a script the narrator cannot finish inside the short, or
+    narration written as captions instead of prose.
     """
     gaps: list[str] = []
     blocks = _shot_blocks(text)
@@ -508,6 +546,8 @@ def _plan_gaps(text: str, shots: list[Shot], image_prompts: dict[int, str], *,
                    if not any(label in block.lower() for label in labels)]
         if missing:
             gaps.append(f"shot(s) {_ranges(missing)} are missing the `{name}` field")
+    if hook_required:
+        gaps.extend(_hook_gaps(text, shots))
     if not image_prompts:
         gaps.append("the `--- IMAGE GENERATION PROMPTS ---` section is missing")
     else:
@@ -528,7 +568,37 @@ def _plan_gaps(text: str, shots: list[Shot], image_prompts: dict[int, str], *,
                     "shot): rewrite every Narration line as 2-3 connected sentences of a "
                     "storyteller's voice-over, 16-20 words each, each line continuing the one "
                     "before it, without describing the picture")
+    if max_words and _total_spoken_words(shots) > max_words:
+        total = _total_spoken_words(shots)
+        gaps.append(f"the narration is {total} words, but at the narrator's fixed pace this short "
+                    f"carries at most {max_words}: cut about {total - max_words} words by "
+                    f"tightening lines and dropping beats — the read is never sped up to fit")
     return gaps
+
+
+def _hook_gaps(text: str, shots: list[Shot]) -> list[str]:
+    """The opening line is the one thing a viewer judges before the story reaches them.
+
+    A stated hook that Shot 1 does not speak is worse than no hook, because the plan then opens on
+    scenery while claiming to open on tension — so the stated line and the spoken line are checked
+    against each other, and the mismatch is repaired rather than shipped.
+    """
+    hook = parse_hook(text)
+    if not hook:
+        missing = ("the `Hook:` line is missing: state the narrator's opening sentence (10-16 words, "
+                   "who + what is wrong + what it costs) above the title")
+        return [missing]
+    problem = _hook_problem(hook)
+    if problem:
+        return [problem]
+    opening = (shots[0].narration or "").strip()
+    if not _opens_with(opening, hook):
+        first = re.split(r"(?<=[.!?])\s+", opening)[0][:90] if opening else "nothing"
+        mismatch = (f"Shot 1 does not open with the Hook line. Its Narration begins {first!r}: the "
+                    f"first words the narrator says must be the Hook, word for word, before any "
+                    f"scenery or backstory")
+        return [mismatch]
+    return []
 
 
 def _request_repair(messages: list[dict], text: str, gaps: list[str], api_key: str, *,
@@ -882,6 +952,11 @@ def _spoken_words(shots: list[Shot]) -> float:
     return sum(len(line.split()) for line in spoken) / len(spoken) if spoken else 0.0
 
 
+def _total_spoken_words(shots: list[Shot]) -> int:
+    """How many words the narrator has to read: at a fixed pace, this is the runtime."""
+    return sum(len(s.speech.split()) for s in shots if s.speech)
+
+
 def validate_story_position(shots: list[Shot], part: int, total_parts: int) -> list[str]:
     """Check that a plan ends the way its position in the arc requires.
 
@@ -980,6 +1055,71 @@ def parse_title(text: str) -> str:
     if not title:
         logger.info("Planner title unusable (%r); ignoring it", match.group(1)[:60])
     return title
+
+
+# The hook is spoken before the story moves, so it has to fit in one breath at 158 wpm: 16 words is
+# ~6 s, a sixth of a 55 s short. Below 7 words it cannot carry who + what is wrong; above 26 it is
+# no longer a hook, it is the first paragraph.
+HOOK_MIN_WORDS = 7
+HOOK_MAX_WORDS = 26
+
+# Openers that spend the hook on setup instead of tension. Each one was measured as a weak opening
+# in the hook research: they ask the viewer to wait for the story to start, and the swipe is cheaper
+# than the wait. `This is the story of` is deliberately absent — it works when the clause after it
+# carries a contradiction, which the prompt requires and the length floor leaves room for.
+_HOOK_BANNED_OPENERS = (
+    "once upon a time", "in a world", "in a land", "long ago", "far away", "far in the future",
+    "have you ever", "what if", "imagine if", "this is a story about",
+)
+
+
+def parse_hook(text: str) -> str:
+    """Read the narrator's opening line the planner states as `Hook: "..."`.
+
+    The hook is not decoration: it is the first sentence of Shot 1, so a plan that states a hook
+    and then opens the shot on weather has not been followed. Returns "" when the planner stated
+    none, which `_plan_gaps` reports rather than guessing one.
+    """
+    match = re.search(r"^\s*[-*#\s]*\**\s*hook\s*\**\s*[:=]\s*(.+?)\s*$",
+                      text or "", re.IGNORECASE | re.MULTILINE)
+    if not match:
+        return ""
+    hook = match.group(1).strip().strip("*_`").strip()
+    while len(hook) >= 2 and hook[0] in "\"'\u201c" and hook[-1] in "\"'\u201d":
+        hook = hook[1:-1].strip()
+    hook = " ".join(hook.split())
+    if not re.search(r"[A-Za-z]", hook):
+        return ""
+    return hook
+
+
+def _hook_problem(hook: str) -> str:
+    """Why this hook will not hold a scrolling viewer, phrased as a repair instruction, or ""."""
+    words = hook.split()
+    low = hook.lower().strip(" \"'\u201c\u201d")
+    for opener in _HOOK_BANNED_OPENERS:
+        if low.startswith(opener):
+            return (f"the Hook opens with `{opener}`, which is setup rather than tension: start "
+                    f"inside this story with a person, what is wrong, and what it will cost")
+    if len(words) < HOOK_MIN_WORDS:
+        return (f"the Hook is {len(words)} words: it needs {HOOK_MIN_WORDS}-16 to name someone, "
+                f"the thing that is wrong, and the cost")
+    if len(words) > HOOK_MAX_WORDS:
+        return (f"the Hook is {len(words)} words, too long to be spoken before the story moves: "
+                f"cut it to {HOOK_MIN_WORDS}-16 and leave the explanation for later shots")
+    return ""
+
+
+def _opens_with(narration: str, hook: str, *, words: int = 6) -> bool:
+    """True when `narration` starts with the hook (punctuation, case and quotes ignored)."""
+    def norm(text: str) -> list[str]:
+        return re.sub(r"[^a-z0-9 ]", " ", (text or "").lower()).split()
+
+    heard, stated = norm(narration), norm(hook)
+    if not heard or not stated:
+        return False
+    span = min(words, len(stated), len(heard))
+    return span >= 4 and heard[:span] == stated[:span]
 
 
 TITLE_INSTRUCTIONS = (
@@ -1117,6 +1257,7 @@ def plan_shorts_detailed(
     story_so_far: list[str] | None = None,
     parts_range: tuple[int, int] = (1, MAX_PARTS),
     gemini_key: str = "",
+    max_words: int = 0,
 ) -> tuple[list[Shot], dict[int, str], bool, int]:
     """Run the detailed prompt and parse its structured output.
 
@@ -1125,8 +1266,15 @@ def plan_shorts_detailed(
     shots when the pacing wanted 13.
 
     `part` / `total_parts` decide whether the short is allowed to end: a middle part must close on
-    a hook, only the last part may resolve. `story_so_far` is the narration of the earlier parts,
-    so a later part continues the same story instead of inventing a new one.
+    a hook, only the last part may resolve. They also decide what the opening line has to do: a
+    new story or a single-part short states the story's question, while a later part re-hooks a
+    viewer who never saw part 1 instead of recapping it. `story_so_far` is the narration of the
+    earlier parts, so a later part continues the same story — and the same narrator — instead of
+    inventing a new one.
+
+    `max_words` is the hard word ceiling for this part. Narration is read at a fixed pace, so the
+    word count is the runtime: a plan above the ceiling is re-asked with the cut named, because the
+    renderer will extend the video rather than speed the narrator up.
 
     `total_parts=None` means `SERIES_PARTS=auto`: the planner decides the arc length itself, from
     `parts_range`, and states it as an `Arc: N parts` line in the same reply — one request, not two.
@@ -1162,9 +1310,19 @@ def plan_shorts_detailed(
                        f"{per_shot + 4} words in each of the {want} Narration lines. Count them. A "
                        f"4-8 word line is a caption and will be rejected; the story has to be "
                        f"told, so spend the words on tension, consequence and what she is "
-                       f"thinking — never on describing the picture, which the viewer can see.")
+                       f"thinking — never on describing the picture, which the viewer can see. The "
+                       f"Hook is the first sentence of shot 1, so shot 1 spends its words on the "
+                       f"hook plus one clause that moves the story.")
             user += (f"\nNarration: {per_shot - 3}-{per_shot + 4} words per shot, "
                      f"about {total_words} words in total.")
+        if max_words:
+            system += (f"\n\n## Word ceiling\nThe narration is read at a fixed pace and is never "
+                       f"sped up, so every word you write is a second of video. This short has room "
+                       f"for at most {max_words} spoken words in total. Do not exceed it: tighten "
+                       f"the lines rather than cutting a beat's meaning, and if the story genuinely "
+                       f"cannot be told inside it, raise the part count (the arc) instead of "
+                       f"writing longer parts.")
+            user += f"\nHard ceiling: {max_words} spoken words in total."
 
     # Position in the arc decides the ending: hook in the middle, resolution only at the end.
     if decide_arc:
@@ -1175,30 +1333,41 @@ def plan_shorts_detailed(
                    f"needs a hunt, a descent and a reunion is 3. If N is 1, the last shot must "
                    f"resolve the story (Narrative role: resolution). If N is more than 1, part 1 "
                    f"does not resolve: end on a hook, so the last shot is build_tension or "
-                   f"deliver_payload, never resolution.")
+                   f"deliver_payload, never resolution.\n\nThe Hook opens the arc: it puts the "
+                   f"story's question on the table, and part 1 only deepens it.")
         user += (f"\nStory position: part 1 of an arc you choose ({lo}-{hi} parts)."
                  f"\nStart with `Arc: N parts`, then the count line.")
     elif total_parts > 1 and part < total_parts:
         ending = (f"This is part {part} of {total_parts}, NOT the end — the story continues in "
                   f"part {part + 1}. Do not resolve it: end on a hook, and the last shot must be "
                   "build_tension or deliver_payload, never resolution.")
-        system += (f"\n\n## Story position\nThis short is part {part} of {total_parts}. {ending}")
+        system += (f"\n\n## Story position\nThis short is part {part} of {total_parts}. {ending}"
+                   f"\n\nThe Hook is a re-hook, not a recap: assume the viewer has not seen part "
+                   f"{part - 1}. Give one clause of load-bearing context — who they are, what they "
+                   f"are chasing, what it now costs them — then the new turn. No 'previously on', "
+                   f"no montage of earlier beats, never more than one clause of background.")
         user += f"\nStory position: part {part} of {total_parts}."
     else:
         ending = ("This is the final part: the last shot must resolve the story "
                   "(Narrative role: resolution).")
         if total_parts > 1:
             system += (f"\n\n## Story position\nThis short is part {part} of {total_parts}. "
-                       f"{ending}")
+                       f"{ending}\n\nThe Hook still has to stand on its own, because most viewers "
+                       f"will meet the story here: one clause of who and what is at stake, then "
+                       f"the ending's turn.")
             user += f"\nStory position: part {part} of {total_parts}."
         else:
-            system += f"\n\n## Story position\nThis is a complete single-part short. {ending}"
+            system += (f"\n\n## Story position\nThis is a complete single-part short. {ending}"
+                       f"\n\nThe Hook poses the story's question and the last shot answers it.")
             user += "\nStory position: the whole story, one part."
     if story_so_far:
         # Two parts of recap: a third part that only sees the last 12 lines forgets how the story
         # opened. ~24 lines is ~350 input tokens, far inside the completion budget.
         recap = "\n".join(f"- {line}" for line in story_so_far[-24:])
-        user += f"\n\nStory so far (already told, do not repeat):\n{recap}"
+        user += (f"\n\nStory so far (already told, do not repeat):\n{recap}\n\nKeep the same "
+                 f"narrator: the person and tense of these lines decide the person and tense of "
+                 f"the Hook and every Narration line here — a story that switches from 'he' to 'I' "
+                 f"between parts sounds like a different narrator took over.")
 
     messages = [
         {"role": "system", "content": system},
@@ -1218,7 +1387,8 @@ def plan_shorts_detailed(
     # the fabrication then ships in the video. Two bounded rounds, and a round that does not reduce
     # the gap count is discarded — an unattended run cannot spend the day retrying.
     for round_no in range(1, PLAN_REPAIR_ROUNDS + 1):
-        gaps = _plan_gaps(text, shots, image_prompts, want=want, need_arc=decide_arc)
+        gaps = _plan_gaps(text, shots, image_prompts, want=want, need_arc=decide_arc,
+                          max_words=max_words)
         if not gaps:
             break
         logger.info("Plan is incomplete (round %d/%d): %s",
@@ -1227,7 +1397,8 @@ def plan_shorts_detailed(
         if not repaired:
             break
         shots2, image_prompts2 = parse_detailed_response(repaired)
-        remaining = _plan_gaps(repaired, shots2, image_prompts2, want=want, need_arc=decide_arc)
+        remaining = _plan_gaps(repaired, shots2, image_prompts2, want=want, need_arc=decide_arc,
+                               max_words=max_words)
         if len(remaining) >= len(gaps):
             logger.warning("Repair left %d gap(s) of %d; keeping the first plan",
                            len(remaining), len(gaps))
@@ -1272,6 +1443,13 @@ def plan_shorts_detailed(
 
     logger.info("Detailed scene plan: %d shots, %d unique image prompts",
                 len(shots), len(image_prompts))
+    # The hook is the first thing a viewer hears, so it is logged on its own line: a run whose
+    # first line is scene-setting is visible in the log instead of only in the retention graph.
+    hook = parse_hook(text)
+    if hook:
+        logger.info("Opening hook: %s", hook)
+    else:
+        logger.warning("Plan stated no `Hook:` line; the short opens on whatever shot 1 says")
     title = (parse_title(text) or request_title(shots, api_key, gemini_key=gemini_key)
              or title_from_plan(shots) or fallback_title(shots))
     if title:

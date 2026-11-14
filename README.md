@@ -42,6 +42,50 @@ a plan whose lines average under 11 words triggers exactly one repair request. P
 **scene first** and the character signature last — a leading character paragraph collapses every
 frame into the same portrait (measured: 7 medium portraits vs. 13 varied shots).
 
+### The opening hook (why a new story does not start on weather)
+
+Every plan states a `Hook:` line above the title, and Shot 1's Narration must begin with that
+sentence word for word. The hook is one spoken line, 10–16 words, whose job is to make a stranger
+who has never seen the story need the next ten seconds: a person, in this story's place, against
+one broken rule or one price — a flat fact, not a greeting, a question or a skyline.
+
+This is checked, not hoped for: `parse_hook()` reads the line, `_hook_problem()` rejects a hook
+that opens with setup ("once upon a time", "in a world", "long ago", "have you ever") or that is
+too short or too long to be spoken, and `_hook_gaps()` compares the stated hook against the first
+words Shot 1 actually says. Any failure is a repair instruction, so the planner rewrites the whole
+storyboard once instead of shipping the mismatch (`tests/test_scenes.py::TestOpeningHook`,
+`tests/test_plan_repair.py`). A past short is the reason this exists: its first line was
+"The mist clung to Oakhaven's rooftops when Kael arrived" — atmosphere with nothing at stake.
+
+What the position in the arc changes:
+
+| Position | The opening line must |
+|---|---|
+| part 1, or a single-part short | state the story's question, in the story's own world |
+| a middle or final part (2…N) | **re-hook, not recap**: one clause of load-bearing context (who, what they are chasing, what it now costs), then the new turn. No "previously on" |
+
+The research behind that split: viewers decide inside the first 1–3 s, before any context lands;
+curiosity comes from a gap the viewer expects to be closed soon (Loewenstein's information-gap
+theory); scenario openings beat question openings by 3–6× in measured short-form data, while
+question hooks underperform every other family above 1,000 followers; openings built on setup,
+weather or a logo lose the scroll; and serialized "previously on" recaps measurably *lower*
+retention versus opening on the new stake. A "This is the story of…" frame is allowed only when
+the clause after it already carries the contradiction or the cost ("…a boy who sold memories and
+forgot his own sister"), never a bare name — the phrase is a promise, and a promise needs stakes.
+The story title is never spoken: it is the upload title, the thumbnail and the channel grid.
+
+Later parts also inherit the narrator: `story_so_far` pins the person and tense, which is how the
+part-2 voice flip (third person → "my palm") is meant to stop.
+
+### Place changes
+
+When a shot's `Place` differs from the one before it, the **first clause** of that shot's narration
+carries the move ("By the time he reached the Spire…", "Back at the shrine…"). It is fused into a
+sentence that already does story work, never a standalone "Later, at the temple." — a whole line
+of signposting costs six words of runtime and earns none of them back, while the fused clause
+costs nothing and keeps a viewer who looked away for two seconds oriented. The rule lives in the
+planner prompt only; it is a taste call, not something the pipeline re-asks over.
+
 ### Character consistency (why the pictures hold together)
 
 1. **Art direction first.** Identity never depends on the face: each arc gets its own short
@@ -60,11 +104,23 @@ frame into the same portrait (measured: 7 medium portraits vs. 13 varied shots).
 
 `IMAGE_STRATEGY=edit|sheet|fresh` pins the choice; `--strategy` overrides one run.
 
-### Runtime is emergent, not fixed
+### Runtime is emergent, and the narrator never changes pace
 
-Narration is synthesised at **natural pace** (speed 1.0). Speed is only adjusted when the total
-falls outside `MIN_SECONDS`–`MAX_SECONDS` (default 45–75 s), so an 8-beat story typically lands
-~50–60 s without the drawl of a forced 55 s. Tune with `MIN_SECONDS` / `MAX_SECONDS`.
+Narration is synthesised at **natural pace** (speed 1.0) and is **never time-scaled** — not per
+shot, not per part. A long script extends the video instead, because a sped-up read is not
+understandable to viewers whose first language is not English, and most of a Shorts feed is
+watched that way. Every still is already held for its own line (`beat_track`), so a longer beat
+simply holds longer.
+
+Because the word count is the runtime, over-length is handled at plan time, in words: the planner
+receives a hard ceiling (`MAX_SECONDS` minus the breaths and the tail hold, converted at 158 wpm)
+and a plan above it is re-asked once with the cut named (`_plan_gaps(max_words=…)`). A plan that
+still overshoots renders long — with a `WARNING` — until it would stop being a Short: past
+`HARD_MAX_SECONDS` (default 175 s) the run refuses to upload rather than speed the narrator up or
+publish a non-Short, and the part stays queued.
+
+`MIN_SECONDS` now only sizes the plan (`SHOTS_PER_PART`); it does not slow speech down either.
+Tune the slot with `MIN_SECONDS` / `MAX_SECONDS` / `PREFERRED_SECONDS`.
 
 ### Subtitles
 
