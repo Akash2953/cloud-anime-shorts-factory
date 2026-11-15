@@ -10,7 +10,7 @@ import unittest
 from scenes import (
     HOOK_MAX_WORDS, NARRATIVE_ROLES, SHOT_SIZES, STYLE, Shot, _hook_problem, _infer_character,
     _opens_with, _plan_gaps, _spoken_words, _template_shots, _total_spoken_words, anchor_prompt,
-    fit_shot_count,
+    fit_shot_count, with_pose as from_scenes_with_pose,
     make_character, parse_detailed_response, parse_hook, parse_plan, plan_shots, reuse_image_refs,
     shots_for_duration, unique_prompts, words_for_duration,
 )
@@ -712,6 +712,58 @@ class TestOfflineFallback(unittest.TestCase):
         self.assertTrue(fallback)
         self.assertEqual(len(shots), 13)
         self.assertTrue(all(s.narration.endswith(".") for s in shots))
+
+
+class TestPoseContract(unittest.TestCase):
+    """Every character beat must state a body, or the cast keeps the canonical frame's pose.
+
+    The planner's image prompts name setting, atmosphere and the character signature and nothing
+    else: in a measured render that produced four shots, four backgrounds, one head angle and one
+    neutral frown — identity-conditioned edits then preserved the pose because identity was the
+    only body description in the request. The planned `action` is a full sentence about the body,
+    so it is put back as the pose, with an expression from the beat's job.
+    """
+
+    def shot(self, action: str, role: str = "build_tension", character: bool = True) -> Shot:
+        return Shot(
+            narration="The wind takes the lantern and the light goes out.",
+            shot_size="medium", place="a rain-slicked roof", action=action,
+            story_object="lantern", narrative_role=role, camera="static",
+            character=character, seconds=7.0,
+            image_generation_prompt="Anime style, rooftop at night, cold blue light, "
+                                    "a girl in a black hooded raincoat with a red scarf. "
+                                    "No text, no watermark.")
+
+    def test_the_action_becomes_the_pose(self):
+        s = self.shot("She raises the lantern above her head.")
+        prompt, _ = unique_prompts([s], {}, CHARACTER)
+        self.assertIn("Pose and body: she raises the lantern above her head", prompt[0])
+
+    def test_the_expression_comes_from_the_beats_job(self):
+        tense, _ = unique_prompts([self.shot("She waits", "build_tension")], {}, CHARACTER)
+        raw, _ = unique_prompts([self.shot("She waits", "emotional_beat")], {}, CHARACTER)
+        self.assertIn("Expression: strained", tense[0])
+        self.assertIn("Expression: unsteady", raw[0])
+        self.assertNotEqual(tense[0], raw[0])
+
+    def test_two_shots_in_the_same_place_get_different_bodies(self):
+        a = self.shot("She presses her back against the wall.")
+        b = self.shot("She kneels to the grate and pries it open.")
+        prompts, _ = unique_prompts([a, b], {}, CHARACTER)
+        self.assertIn("presses her back", prompts[0])
+        self.assertIn("kneels to the grate", prompts[1])
+        self.assertEqual(len(prompts), 2)
+
+    def test_the_pose_lands_before_the_trailing_guard_and_only_once(self):
+        s = self.shot("She raises the lantern.")
+        prompt, _ = unique_prompts([s], {}, CHARACTER)
+        self.assertLess(prompt[0].index("Pose and body:"), prompt[0].index("No text, no watermark"))
+        self.assertEqual(from_scenes_with_pose(prompt[0], s), prompt[0])
+
+    def test_an_insert_gets_no_pose(self):
+        prompt, _ = unique_prompts([self.shot("The latch snaps shut.", character=False)],
+                                   {}, CHARACTER)
+        self.assertNotIn("Pose and body:", prompt[0])
 
 
 if __name__ == "__main__":

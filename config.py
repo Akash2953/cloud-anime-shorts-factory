@@ -1,7 +1,7 @@
 """Configuration and constants for the Cloud Anime Shorts Factory."""
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 from antigravity_oauth import ANTIGRAVITY_OAUTH_CREDENTIAL
@@ -34,26 +34,6 @@ class Limits:
     max_daily_uploads: int = 1
     openrouter_free_daily_limit: int = 50
     openrouter_free_minute_limit: int = 20
-
-
-@dataclass(frozen=True)
-class Quotas:
-    """Runtime quota counters persisted in state."""
-
-    images_attempted_today: int = 0
-    stories_requested_today: int = 0
-    uploads_today: int = 0
-    last_reset_date: str = ""
-
-
-@dataclass(frozen=True)
-class Defaults:
-    model_ids: dict = field(default_factory=lambda: {
-        "image": "black-forest-labs/FLUX.1-schnell-Free",
-    })
-    workflow_url_template: str = (
-        "https://api.github.com/repos/{owner}/{repo}/actions/workflows"
-    )
 
 
 def _as_int(raw: str | None, default: int) -> int:
@@ -116,15 +96,11 @@ def load_config() -> dict:
         "ANTIGRAVITY_OAUTH_CLIENT_SECRET": os.environ.get("ANTIGRAVITY_OAUTH_CLIENT_SECRET", ""),
         "ANTIGRAVITY_PROJECT_ID": os.environ.get("ANTIGRAVITY_PROJECT_ID", ""),
         "OPENROUTER_API_KEY": os.environ.get("OPENROUTER_API_KEY", ""),
-        # Optional local gateway (OmniRoute). Not used by the daily pipeline today.
-        "OMNIROUTE_API_KEY": os.environ.get("OMNIROUTE_API_KEY", ""),
-        "OMNIROUTE_BASE": os.environ.get("OMNIROUTE_BASE", "http://localhost:20128"),
-        "HF_TOKEN": os.environ.get("HF_TOKEN", ""),
-        "HF_ENABLED": os.environ.get("HF_ENABLED", "false").lower() == "true",
-        "GITHUB_OWNER": os.environ.get("GITHUB_OWNER", ""),
-        "GITHUB_REPO": os.environ.get("GITHUB_REPO", ""),
-        "GITHUB_PAT": os.environ.get("GITHUB_PAT", ""),
-        "FFMPEG_AVAILABLE": True,
+        # Agnes AI (images). Free at every resolution tier today, and the only provider that
+        # answers 9:16 at 2K (1472x2624), so it renders before Antigravity and Workers AI.
+        "AGNES_API_KEY": os.environ.get("AGNES_API_KEY", ""),
+        "AGNES_IMAGE_MODEL": os.environ.get("AGNES_IMAGE_MODEL", ""),
+        "AGNES_IMAGE_SIZE": os.environ.get("AGNES_IMAGE_SIZE", ""),
         "KOKORO_VOICE": os.environ.get("KOKORO_VOICE", "af_heart"),
         # Daily image ceiling. 16 = one image per beat for the longest short (13-16 shots), so
         # reuse only kicks in above that. Raise for interactive development.

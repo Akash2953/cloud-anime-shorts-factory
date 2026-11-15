@@ -42,6 +42,40 @@ a plan whose lines average under 11 words triggers exactly one repair request. P
 **scene first** and the character signature last — a leading character paragraph collapses every
 frame into the same portrait (measured: 7 medium portraits vs. 13 varied shots).
 
+The same rule governs the identity-conditioned edit, and it was learned twice: `images.py` used to
+open each edit with "Keep the EXACT same character … as the reference image", which made the
+reference the first and loudest instruction. Agnes then returned the reference composition for
+five of eight shots the plan had made different — a close-up, a medium, a wide, a close-up and a
+medium scored 1.5–7.1 mean luma diff against the canonical frame, against >12 for the shots that
+actually changed. Edits now lead with the shot, say what has to change, and name identity in one
+trailing clause; `NEAR_COPY_DIFF` catches a render that is still a near-copy and asks once more
+with the reference limited to face and costume. Planner boilerplate `9:16 portrait composition`
+was replaced by each shot's own size and camera (`scenes.reframe_composition`), so a cliffside
+wide is not asked for a portrait.
+
+Identity is not pose. The planner's image prompt names setting, atmosphere and the character
+signature, and nothing else about the body — so the second render kept the design and froze the
+body: four backgrounds, one head angle, one neutral frown. The plan already writes the action as
+a full sentence about the body (“He raises the lantern high above his head”), so
+`scenes.with_pose()` puts it back as `Pose and body: …` plus an expression drawn from the beat's
+`narrative_role`, for character beats only. The edit instruction then says the reference supplies
+the design and explicitly not this frame's stance, head angle, hands or expression.
+
+That contract only holds with a model that will leave the reference's pose. The decisive
+measurement was one prompt and one canonical frame sent to both providers: `gemini-3.1-flash-image`
+returned the planned back-against-the-wall, one hand on the stone and the other on his chest;
+Agnes returned the canonical three-quarter turn, hand out, again. So the edit path is Antigravity
+first, Agnes is not an edit fallback (without an Antigravity key the run renders `fresh`), and the
+canonical frame is rendered by the same family that edits it — a short drawn by two model families
+changes art style at the cut.
+
+Repeats are caught against **every frame already rendered**, not only the canonical one: shot 6
+twice came back as shot 2 (hand out at the same wall) while sitting 13.9 away from the canonical,
+under a canonical-only guard's nose. A repeat is retried as an edit once with the reference
+restricted to face and costume — and if it repeats again, the shot is rendered **fresh** instead,
+because an edit is anchored to the reference and a fresh render is the only move that can change
+the staging. That pair is now a profile against an icy window against a side view in the street.
+
 ### The opening hook (why a new story does not start on weather)
 
 Every plan states a `Hook:` line above the title, and Shot 1's Narration must begin with that
@@ -177,14 +211,24 @@ next provider:
 | Job | 1st | 2nd | 3rd |
 |---|---|---|---|
 | Story text | Antigravity OAuth (`gemini.py`) | OpenRouter free models | local template |
-| Images | Antigravity OAuth | Workers AI `flux-1-schnell` / `flux-2-klein` | — |
+| Images | Antigravity OAuth (`gemini-3.1-flash-image`) | Agnes `agnes-image-2.5-flash` @2K (`agnes.py`) | Workers AI `flux-1-schnell` / `flux-2-klein` |
 
 Antigravity model names are overridable (`ANTIGRAVITY_TEXT_MODEL`,
-`ANTIGRAVITY_IMAGE_MODEL`). An Antigravity `429` falls back to OpenRouter for story text or
-Workers AI for images. Antigravity image requests specify a `9:16` aspect ratio, and returned
-images are center-cropped to that exact ratio before use. `images.fresh_image` / `images.edit_image`
-choose the image provider, so the strategy engine (`edit` / `sheet` / `fresh`) behaves identically
-on either provider.
+`ANTIGRAVITY_IMAGE_MODEL`, `ANTIGRAVITY_IMAGE_SIZE`, default `2K`). An Antigravity `429` falls
+back to OpenRouter for story text or to the next image provider. Antigravity image requests
+specify a `9:16` aspect ratio and a 2K tier, and returned images are center-cropped to that exact
+ratio before use. `images.fresh_image` / `images.edit_image` choose the image provider, so the
+strategy engine (`edit` / `sheet` / `fresh`) behaves identically on either provider.
+
+**Antigravity renders before Agnes when an Antigravity key is set**, because of the body: handed
+the same prompt and the same canonical frame, `gemini-3.1-flash-image` re-staged the character as
+the shot asked, while Agnes returned the canonical pose again. Identity is not the only thing an
+identity-conditioned edit carries — pose comes with it — so the provider that can leave the
+reference's pose gets the edit path, and it also renders the frames it edits from (a short drawn
+by two model families changes art style at the cut). Agnes is not a fallback for edits for the
+same reason: without an Antigravity key the run renders `fresh` instead, where nothing is copied
+and the planned action survives. `AGNES_IMAGE_MODEL` and `AGNES_IMAGE_SIZE` override the model and
+tier; Agnes still answers `1472x2624` at 2K and is used whenever Antigravity refuses.
 
 ### Zero-spend policy
 - No provider assumed to offer a permanent free quota.
@@ -298,6 +342,7 @@ first scheduled run.
 | `CF_ACCOUNT_ID` | Cloudflare account ID (for Workers AI; falls back to `R2_ACCOUNT_ID`) |
 | `YOUTUBE_CLIENT_ID` / `CLIENT_SECRET` / `REFRESH_TOKEN` | YouTube OAuth |
 | `OPENROUTER_API_KEY` | Story planning fallback when Antigravity refuses |
+| `AGNES_API_KEY` | Agnes AI (OpenAI-compatible) — image provider after Antigravity, and the one that renders when no Antigravity key exists; 2K `9:16` renders, free at every resolution tier today |
 | `KOKORO_VOICE` | Optional — narration voice (default `af_heart`) |
 
 Local `.env` (gitignored) is read by `config.load_config()`; the same names work as GitHub
@@ -339,7 +384,7 @@ Environment knobs: `IMAGE_STRATEGY`, `MIN_SECONDS`, `MAX_SECONDS`, `SERIES_PARTS
 `MAX_IMAGE_ATTEMPTS`, `ANTIGRAVITY_REFRESH_TOKEN`, `ANTIGRAVITY_OAUTH_CLIENT_ID`,
 `ANTIGRAVITY_OAUTH_CLIENT_SECRET`,
 `ANTIGRAVITY_ACCESS_TOKEN`, `ANTIGRAVITY_PROJECT_ID`, `ANTIGRAVITY_TEXT_MODEL`,
-`ANTIGRAVITY_IMAGE_MODEL`, `OPENROUTER_MODELS`.
+`ANTIGRAVITY_IMAGE_MODEL`, `ANTIGRAVITY_IMAGE_SIZE`, `OPENROUTER_MODELS`.
 
 > **Story fallback ordering.** Antigravity OAuth (`ANTIGRAVITY_TEXT_MODEL`, default
 > `gemini-3-flash`) → OpenRouter (`OPENROUTER_MODELS`, comma separated; defaults walk

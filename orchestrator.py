@@ -27,8 +27,9 @@ from render import render_narration
 # have faster-whisper installed shouldn't pay its import cost on startup.
 from scenes import (MAX_PARTS, Shot, make_character, plan_arc, plan_shorts_detailed,
                     reuse_image_refs, shots_for_duration, title_from_line, unique_prompts,
+                    _validate_title as validate_title,
                     validate_story_position, words_for_duration)
-from state import compute_fingerprint, parse_state, save_state, today_key
+from state import parse_state, save_state, today_key
 
 logging.basicConfig(level=logging.INFO, stream=sys.stdout)
 logger = logging.getLogger(__name__)
@@ -48,11 +49,20 @@ def story_title(state: dict) -> str:
 
     Older state has no `title` (it was never asked for), so fall back to the first narration
     line rather than to the series id — the id is a date, and a date is not a title.
+
+    A stored title is re-validated on read, not trusted: a series planned before the planner's
+    titles were validated carries a sentence fragment, and a stored title outranks every plan
+    that comes after it, so one bad part 1 named the whole arc. "The mist clung to Oakhaven's
+    rooftops when #3/3" is what that looked like on YouTube.
     """
     series = state.get("series") or {}
-    title = (series.get("title") or "").strip()
+    stored = (series.get("title") or "").strip()
+    title = validate_title(stored)
     if title:
         return title
+    if stored:
+        logger.warning("Stored series title unusable (%r); naming the upload from the narration",
+                       stored[:60])
     for part in series.get("parts") or []:
         for shot in part or []:
             line = (shot.get("narration") or "").strip()
@@ -75,6 +85,34 @@ def story_upload_title(state: dict, part: int, total_parts: int) -> str:
     if total_parts > 1:
         return f"{title} #{part}/{total_parts}"
     return title
+
+
+def story_description(shots: list[Shot], part: int, total_parts: int, *, tags=(),
+                      music_credit: str = "") -> str:
+    """The description the upload carries: part marker, the narration script, then hashtags.
+
+    Two rules, both about the viewer rather than the pipeline. The narration list is what was
+    actually spoken, so the description reads as the script instead of a keyword dump — and the
+    call to action is not story, so it never appears there. Hashtags close it out because a
+    Shorts description is a search surface: YouTube surfaces the first three above the title, so
+    `#Shorts` leads and the story's own tags follow.
+    """
+    lines = [f"# Part {part} of {total_parts}", "", "# Narration:"]
+    spoken = (s for s in shots
+              if s.speech and s.narrative_role != "call_to_action")
+    for i, shot in enumerate(spoken, 1):
+        lines.append(f"{i}. {shot.speech}")
+    if music_credit:
+        lines += ["", music_credit]
+    hashtags: list[str] = []
+    seen: set[str] = set()
+    for tag in ("Shorts", *tags):  # `#Shorts` leads; the tag list already carries "shorts"
+        handle = f"#{str(tag).replace(' ', '')}"
+        if tag and handle.lower() not in seen:
+            seen.add(handle.lower())
+            hashtags.append(handle)
+    lines += ["", " ".join(hashtags)]
+    return "\n".join(lines)[:5000]
 
 
 def advance_series(state: dict, uploaded_part: int) -> None:
@@ -105,9 +143,7 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None,
         if part and index > len(parts):
             raise RuntimeError(f"part {part} needs parts 1..{index} planned first "
                                f"(only {len(parts)} stored)")
-        if part and index < total_parts:
-            total_parts = max(total_parts, index + 1)
-        elif parts and index >= total_parts:
+        if parts and index >= total_parts:
             logger.info("Series %s complete (%d/%d parts uploaded); starting a new story",
                         series.get("id"), len(parts), total_parts)
             parts, index = [], 0
@@ -276,10 +312,14 @@ def run_pipeline(*, render_only: bool = False,
                  reuse_frames: bool = False, plan_only: bool = False, part: int | None = None) -> None:
     cfg = load_config()
     antigravity_key = cfg.get("ANTIGRAVITY_API_KEY", "")
+    agnes_key = cfg.get("AGNES_API_KEY", "")
     logger.info("Text provider: %s; image provider: %s",
                 "antigravity-oauth" if antigravity_key else (
                     "openrouter" if cfg.get("OPENROUTER_API_KEY") else "local template"),
-                "antigravity-oauth -> workers-ai" if antigravity_key else "workers-ai")
+                " -> ".join(filter(None, [
+                    "agnes-2k" if agnes_key else "",
+                    "antigravity-oauth" if antigravity_key else "",
+                    "workers-ai"])))
     caption_preflight(cfg)
     state = load_state(Path("state.json"))
     fps = 24
@@ -296,8 +336,9 @@ def run_pipeline(*, render_only: bool = False,
     character = ((state.get("series") or {}).get("character")
                  or make_character((state.get("series") or {}).get("id", "arc")))
 
+    img_dir = Path("build/frames")
+    max_image_attempts = int(cfg.get("MAX_IMAGE_ATTEMPTS") or Limits.max_image_attempts_per_day)
     if reuse_frames:
-        img_dir = Path("build/frames")
         frames = load_frames(img_dir)
         if len(frames) >= len(shots):
             frames = frames[:len(shots)]
@@ -306,10 +347,9 @@ def run_pipeline(*, render_only: bool = False,
             logger.warning("Only %d existing frames but need %d", len(frames), len(shots))
             frames = []
     else:
-        img_dir = Path("build/frames")
         daily_cfg = state.setdefault("daily", {}).setdefault(today_key(), {})
         budget = {"attempts": daily_cfg.get("image_attempts", 0),
-                  "max": int(cfg.get("MAX_IMAGE_ATTEMPTS") or Limits.max_image_attempts_per_day)}
+                  "max": max_image_attempts}
         try:
             # Use detailed image prompts if available, otherwise fall back to prompt() builder.
             # Duplicate prompts collapse to one render: the frame is held for every beat that
@@ -325,7 +365,7 @@ def run_pipeline(*, render_only: bool = False,
                 final_prompts, cfa_token=cfg["CFAI_TOKEN"],
                 account_id=cfg["CF_ACCOUNT_ID"], img_dir=img_dir,
                 strategy=strategy, character_flags=chars, character=character, budget=budget,
-                antigravity_key=antigravity_key,
+                antigravity_key=antigravity_key, agnes_key=agnes_key,
             )
             paired = [(shot, rendered[slot]) for shot, slot in zip(shots, slots)
                       if slot < len(rendered)]
@@ -336,9 +376,9 @@ def run_pipeline(*, render_only: bool = False,
             raise
         state.setdefault("daily", {})[today_key()]["image_attempts"] = budget["attempts"]
         Path("state.json").write_text(save_state(state), encoding="utf-8")
-        if budget["attempts"] >= int(cfg.get("MAX_IMAGE_ATTEMPTS") or Limits.max_image_attempts_per_day):
+        if budget["attempts"] >= max_image_attempts:
             logger.warning("Daily image budget exhausted (%d/%d)",
-                           budget["attempts"], int(cfg.get("MAX_IMAGE_ATTEMPTS") or Limits.max_image_attempts_per_day))
+                           budget["attempts"], max_image_attempts)
 
     if not frames:
         logger.error("No images produced — aborting, upload counter untouched.")
@@ -537,19 +577,10 @@ def run_pipeline(*, render_only: bool = False,
         logger.error("YouTube token exchange failed; queue untouched, retrying tomorrow")
         return
     title = story_upload_title(state, part_num, total_parts)
-    description_lines = [
-        f"# Part {part_num} of {total_parts}",
-        "",
-        "# Narration:",
-    ]
-    # The CTA is not story, so it stays out of the description's narration list.
-    for i, line in enumerate((s.speech for s in shots if s.speech and s.narrative_role != "call_to_action"), 1):
-        description_lines.append(f"{i}. {line}")
-    if music_credit:
-        description_lines += ["", music_credit]
-    description = "\n".join(description_lines)
     tags = ["anime", "shorts", "storytime", "mystery", "lantern",
             "rainy city", "vertical video"]
+    description = story_description(shots, part_num, total_parts, tags=tags,
+                                    music_credit=music_credit or "")
     privacy = cfg.get("PUBLISH_PRIVACY", "private")
     video_id = upload_video(video_path.read_bytes(), title, description, access_token,
                             privacy_status=privacy, tags=tags)

@@ -146,3 +146,13 @@ class TestThumbnail(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_a_stored_fragment_is_not_published(self):
+        """Legacy state carries titles written before the planner's titles were validated."""
+        state = {"series": {"title": "The mist clung to Oakhaven's rooftops when", "parts": [[
+            {"narration": "Rain drummed on the tin roof while the city slept."}]]}}
+        self.assertEqual(story_title(state), "Rain drummed on the tin roof")
+
+    def test_a_stored_fragment_with_nothing_usable_behind_it_is_untitled(self):
+        state = {"series": {"title": "The mist clung to Oakhaven's rooftops when", "parts": []}}
+        self.assertEqual(story_title(state), "Untitled Story")

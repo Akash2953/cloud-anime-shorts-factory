@@ -15,6 +15,10 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+# The thumbnail burns text with the same face the captions use, so the feed image and the video
+# look like one product. One candidate list, shared with captions.py rather than copied.
+from captions import _resolve_font as _resolve_font_source
+
 logger = logging.getLogger(__name__)
 
 # Thumbnail canvas. YouTube's documented minimum is 1280x720; Shorts are shown vertically, so a
@@ -24,14 +28,6 @@ THUMB_HEIGHT = 1920
 
 # Roles that carry the story. Ordered by how much they say on their own.
 KEY_ROLES = ("deliver_payload", "emotional_beat", "evidence", "resolution", "build_tension")
-
-FONT_CANDIDATES = (
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/Library/Fonts/Arial Bold.ttf",
-    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-    r"C:\Windows\Fonts\arialbd.ttf",
-    r"C:\Windows\Fonts\DejaVuSans-Bold.ttf",
-)
 
 
 def pick_key_frame(shots, frames: list[Path]) -> Path | None:
@@ -46,12 +42,8 @@ def pick_key_frame(shots, frames: list[Path]) -> Path | None:
 
 
 def _resolve_font(font_path: str | None) -> str:
-    if font_path and Path(font_path).exists():
-        return font_path
-    for cand in FONT_CANDIDATES:
-        if Path(cand).exists():
-            return cand
-    return ""
+    """Same probe order as the captions; only the path is needed here."""
+    return _resolve_font_source(font_path)[0]
 
 
 def _wrap(draw, text: str, font, max_width: int) -> list[str]:

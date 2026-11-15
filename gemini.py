@@ -62,6 +62,10 @@ _ACCESS_TOKEN_LOCK = threading.Lock()
 DEFAULT_IMAGE_MODALITIES: tuple[str, ...] = ("IMAGE",)
 _WIDENED_IMAGE_MODALITIES = ("TEXT", "IMAGE")
 ANTIGRAVITY_IMAGE_ASPECT_RATIO = "9:16"
+# Nano Banana-class models render up to 4K; the default is 1K, which is below the 1080x1920 this
+# pipeline renders and would be upscaled. `ANTIGRAVITY_IMAGE_SIZE` overrides it; a model that
+# rejects the field is retried once without it.
+ANTIGRAVITY_IMAGE_SIZE = os.environ.get("ANTIGRAVITY_IMAGE_SIZE", "2K")
 
 TEXT_TIMEOUT = 180
 IMAGE_TIMEOUT = 300
@@ -450,9 +454,10 @@ def _image_request(model: str, key: str, parts: list[dict], modalities: list[str
     payload = {"contents": [{"role": "user", "parts": parts}],
                "generationConfig": {"responseModalities": modalities}}
     if _uses_antigravity(key):
-        payload["generationConfig"]["imageConfig"] = {
-            "aspectRatio": ANTIGRAVITY_IMAGE_ASPECT_RATIO,
-        }
+        image_config = {"aspectRatio": ANTIGRAVITY_IMAGE_ASPECT_RATIO}
+        if ANTIGRAVITY_IMAGE_SIZE:
+            image_config["imageSize"] = ANTIGRAVITY_IMAGE_SIZE
+        payload["generationConfig"]["imageConfig"] = image_config
         return _antigravity_request(
             model, key, payload, request_type="image_gen", timeout=timeout
         )

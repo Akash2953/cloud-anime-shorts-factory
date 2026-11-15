@@ -10,7 +10,10 @@ from unittest.mock import patch
 
 import numpy as np
 
-from orchestrator import advance_series, beat_track, caption_preflight, resolve_part
+from orchestrator import (
+    advance_series, beat_track, caption_preflight, resolve_part, story_description,
+    story_upload_title,
+)
 from scenes import Shot, _template_shots, words_for_duration
 
 CFG = {
@@ -347,6 +350,56 @@ class TestCaptionPreflight(unittest.TestCase):
         with patch("captions.missing_caption_dependencies") as check:
             caption_preflight({"WORD_CAPTIONS": False})
         check.assert_not_called()
+
+
+class TestUploadMetadata(unittest.TestCase):
+    """What the upload request actually carries: `snippet.title` and `snippet.description`.
+
+    The description used to be assembled inline in the run and never checked, so a change to the
+    shot list could silently drop narration or leak the call to action into the script.
+    """
+
+    TAGS = ["anime", "shorts", "storytime", "mystery", "lantern", "rainy city"]
+
+    def shots(self):
+        def shot(narration, role="build_tension"):
+            return Shot(narration=narration, shot_size="medium", place="a rooftop",
+                        action="He raises the lantern.", story_object="lantern",
+                        narrative_role=role, camera="static", character=True, seconds=7.0)
+
+        return [shot("The lantern answered with a storm."),
+                shot("He sold his name for the light."),
+                shot("Subscribe so you do not miss part 2.", "call_to_action")]
+
+    def test_narration_is_listed_in_order_and_the_cta_is_not(self):
+        desc = story_description(self.shots(), 1, 3)
+        self.assertIn("# Part 1 of 3", desc)
+        self.assertIn("1. The lantern answered with a storm.", desc)
+        self.assertIn("2. He sold his name for the light.", desc)
+        self.assertNotIn("Subscribe", desc)
+
+    def test_hashtags_close_the_description_with_shorts_first_and_no_duplicates(self):
+        desc = story_description(self.shots(), 1, 3, tags=self.TAGS)
+        hashtags = desc.splitlines()[-1]
+        self.assertTrue(hashtags.startswith("#Shorts "))
+        self.assertEqual(hashtags.lower().count("#shorts"), 1)
+        self.assertIn("#rainycity", hashtags)   # a space would split the hashtag in two
+
+    def test_the_music_credit_sits_above_the_hashtags(self):
+        desc = story_description(self.shots(), 2, 3, tags=self.TAGS, music_credit="Music: Someone")
+        self.assertLess(desc.index("Music: Someone"), desc.index("#Shorts"))
+
+    def test_a_long_story_is_capped_at_youtube_limit(self):
+        from scenes import Shot as S
+        many = [S(narration="word " * 400, shot_size="medium", place="p", action="a",
+                  story_object="o", narrative_role="build_tension", camera="static",
+                  character=False, seconds=7.0) for _ in range(10)]
+        self.assertLessEqual(len(story_description(many, 1, 1)), 5000)
+
+    def test_part_marker_is_in_the_title(self):
+        state = {"series": {"title": "The Glass Storm Keeper", "parts": []}}
+        self.assertEqual(story_upload_title(state, 1, 3), "The Glass Storm Keeper #1/3")
+        self.assertEqual(story_upload_title(state, 1, 1), "The Glass Storm Keeper")
 
 
 if __name__ == "__main__":

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import logging
 import re
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -873,30 +872,24 @@ def build_caption_overlays(
         logger.warning("Word alignment produced no cues; using line-level captions instead")
         groups = build_line_level_cues(
             narration_text, segments=segments, audio_duration=audio_duration)
-        if not groups:
-            return []
-        overlays = render_group_pngs(
-            groups, out_dir, accent_palette=accent_palette, font_path=font_path)
-        if cta_block:
-            overlays = _apply_cta_block(overlays, cta_block, out_dir, font_path)
-        return overlays
-    groups = pack_groups(
-        cues,
-        gap_tight_ms=gap_tight_ms,
-        long_word_ms=long_word_ms,
-        max_group=max_group,
-    )
+    else:
+        groups = pack_groups(
+            cues,
+            gap_tight_ms=gap_tight_ms,
+            long_word_ms=long_word_ms,
+            max_group=max_group,
+        )
+        # Never let a caption outlive the picture: the last group's tail can run past the audio
+        # (and therefore past `-t`), which would leave an overlay enabled on a frame that does
+        # not exist. Clamp to the track length and drop anything that starts after it.
+        if audio_duration > 0:
+            groups = [
+                GroupCue(start=g.start, end=min(g.end, audio_duration), words=g.words)
+                for g in groups
+                if g.start < audio_duration
+            ]
     if not groups:
         return []
-    # Never let a caption outlive the picture: the last group's tail can run past the audio
-    # (and therefore past `-t`), which would leave an overlay enabled on a frame that does not
-    # exist. Clamp to the track length and drop anything that starts after it.
-    if audio_duration > 0:
-        groups = [
-            GroupCue(start=g.start, end=min(g.end, audio_duration), words=g.words)
-            for g in groups
-            if g.start < audio_duration
-        ]
 
     overlays = render_group_pngs(
         groups, out_dir,

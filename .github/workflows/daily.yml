@@ -1,8 +1,9 @@
 name: Daily Anime Short
 
 on:
-  schedule:
-    - cron: '0 12 * * *'  # Daily at 12:00 UTC
+  # Daily cron disabled for now — uncomment to re-enable.
+  # schedule:
+  #   - cron: '0 12 * * *'  # Daily at 12:00 UTC
   workflow_dispatch:
 
 permissions:

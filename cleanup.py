@@ -26,7 +26,6 @@ ARTIFACTS: tuple[str, ...] = (
     "build/narration.wav",
     "build/music_bed.wav",
     "build/thumbnail.jpg",
-    "build/concat.txt",
 )
 
 

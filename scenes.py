@@ -522,7 +522,7 @@ def _ranges(numbers: list[int]) -> str:
 
 
 def _plan_gaps(text: str, shots: list[Shot], image_prompts: dict[int, str], *,
-               want: int = 0, need_arc: bool = False, hook_required: bool = True,
+               want: int = 0, need_arc: bool = False,
                max_words: int = 0) -> list[str]:
     """What the planner left out of its reply, phrased as repair instructions.
 
@@ -546,8 +546,7 @@ def _plan_gaps(text: str, shots: list[Shot], image_prompts: dict[int, str], *,
                    if not any(label in block.lower() for label in labels)]
         if missing:
             gaps.append(f"shot(s) {_ranges(missing)} are missing the `{name}` field")
-    if hook_required:
-        gaps.extend(_hook_gaps(text, shots))
+    gaps.extend(_hook_gaps(text, shots))
     if not image_prompts:
         gaps.append("the `--- IMAGE GENERATION PROMPTS ---` section is missing")
     else:
@@ -568,8 +567,8 @@ def _plan_gaps(text: str, shots: list[Shot], image_prompts: dict[int, str], *,
                     "shot): rewrite every Narration line as 2-3 connected sentences of a "
                     "storyteller's voice-over, 16-20 words each, each line continuing the one "
                     "before it, without describing the picture")
-    if max_words and _total_spoken_words(shots) > max_words:
-        total = _total_spoken_words(shots)
+    total = _total_spoken_words(shots) if max_words else 0
+    if total > max_words:
         gaps.append(f"the narration is {total} words, but at the narrator's fixed pace this short "
                     f"carries at most {max_words}: cut about {total - max_words} words by "
                     f"tightening lines and dropping beats — the read is never sped up to fit")
@@ -776,7 +775,88 @@ def _unsplit_layout(text: str) -> tuple[str, bool]:
     return (f"{cleaned} One continuous single frame, no split panels, no diptych.").strip(), True
 
 
-def anchor_prompt(prompt: str, character: bool, character_sig: str = "") -> str:
+def shot_framing(shot: "Shot") -> str:
+    """The framing phrase a prompt should carry: this shot's size and camera move."""
+    size = SHOT_SIZES.get(shot.shot_size, "Medium shot")
+    return f"{size}, camera {shot.camera.replace('_', ' ')}"
+
+
+# What the face is doing, keyed by the beat's job. Without it every frame — and every
+# identity-conditioned edit of the canonical frame — came back with the same neutral frown.
+ROLE_EXPRESSION = {
+    "establish_context": "watchful, taking in the place",
+    "introduce_subject": "guarded, body turned slightly away",
+    "build_tension": "strained, jaw tight, breath held",
+    "deliver_payload": "focused and committed",
+    "emotional_beat": "unsteady, close to the surface",
+    "evidence": "attentive, examining closely",
+    "resolution": "drained but resolved",
+    "call_to_action": "direct, looking at the viewer",
+}
+
+
+def pose_clause(shot: "Shot") -> str:
+    """The body instruction the planner leaves out of its image prompt.
+
+    The plan states the action as a full sentence about the body — "He raises the lantern high
+    above his head" — and the planner's own image prompt names only setting, atmosphere and the
+    character signature. Nothing in the request described a pose, so every character frame reused
+    the canonical one: in a measured render four different shots, four backgrounds, one head angle
+    and one neutral frown, and the identity-conditioned edits preserved it because identity was
+    the only body description they had. This returns the action as an explicit pose plus an
+    expression, so the body changes while the design does not.
+    """
+    action = " ".join((shot.action or "").split()).strip().rstrip(".")
+    if not action:
+        return ""
+    lowered = (action[:1].lower() + action[1:]
+               if action.split(" ", 1)[0] in ("He", "She", "They", "It") else action)
+    expression = ROLE_EXPRESSION.get(shot.narrative_role, "present, in the moment")
+    return f"Pose and body: {lowered}. Expression: {expression}."
+
+
+def with_pose(prompt: str, shot: "Shot") -> str:
+    """Put the planned action back into a prompt as the pose for this frame.
+
+    Only character frames need it (an insert has no body), the clause is added once, and it lands
+    before the trailing `No text, no watermark.` guard rather than after it.
+    """
+    if not shot.character or "Pose and body:" in prompt:
+        return prompt
+    clause = pose_clause(shot)
+    if not clause:
+        return prompt
+    text, tail = prompt or "", ""
+    match = re.search(r"\s*No text, no watermark\.?\s*$", text, re.IGNORECASE)
+    if match:
+        text, tail = text[:match.start()], " No text, no watermark."
+    return f"{text.rstrip(' .')}. {clause}{tail}"
+
+
+_FRAMING_RE = re.compile(r"\b(?:vertical\s+)?9:16\s+(?:portrait\s+)?composition\b"
+                         r"|\bportrait composition\b", re.IGNORECASE)
+
+
+def reframe_composition(text: str, framing: str = "") -> str:
+    """Replace planner framing boilerplate with the shot's own framing.
+
+    Every planned prompt opened with the same `vertical 9:16 portrait composition` clause, so a
+    wide cliffside and a close-up asked the model for the same portrait and the shot size stopped
+    mattering — the collapse that made character edits reproduce the reference frame. The aspect
+    ratio is kept, the composition words are replaced by this shot's size and camera. Also applied
+    to prompts already stored in `state.json`, so an arc planned before this fix renders with its
+    own framing instead of the boilerplate. Idempotent: the phrase is replaced once.
+    """
+    replacement = f"9:16 vertical framing, {framing}" if framing else "9:16 vertical framing"
+    out, replaced = _FRAMING_RE.subn(replacement, text or "")
+    if not replaced:
+        return text
+    out = re.sub(r"\s*,\s*,+", ", ", out)
+    return " ".join(out.split()).strip()
+
+
+def anchor_prompt(prompt: str, character: bool, character_sig: str = "",
+                  framing: str = "") -> str:
     """Force the art direction and identity anchor onto a planner-written image prompt.
 
     The detailed planner writes prompts that share no style words between frames ('Cyberpunk art
@@ -790,6 +870,10 @@ def anchor_prompt(prompt: str, character: bool, character_sig: str = "") -> str:
     if unsplit:
         logger.info("Rewrote a split/panel composition request into one continuous frame")
     text = re.sub(r"[,.]?\s*engagement hook of [^.,]+[.,]?", "", text, flags=re.IGNORECASE)
+    # "9:16 portrait composition" is planner boilerplate that lands in every prompt, so a wide
+    # cliffside and a close-up both ask for a portrait and the shot size stops mattering. The
+    # aspect ratio stays; the framing now comes from the shot itself (`framing`).
+    text = reframe_composition(text, framing)
     if not character:
         text = _strip_signature(text, character_sig)
     text = " ".join(text.split()).strip()
@@ -801,7 +885,8 @@ def anchor_prompt(prompt: str, character: bool, character_sig: str = "") -> str:
     if character and character_sig and character_sig.lower() not in low:
         trail.append(f"{character_sig}, seen as part of the scene.")
     if "9:16" not in text and "portrait" not in low:
-        trail.append("Vertical 9:16 portrait composition.")
+        trail.append(f"Vertical 9:16 framing, {framing}." if framing else
+                     "Vertical 9:16 framing.")
     if "no text" not in low:
         trail.append("No text, no watermark.")
     return " ".join(part for part in (style, body, *trail) if part)
@@ -850,20 +935,6 @@ def _map_shot_type(raw: str) -> str:
     return "medium"
 
 
-def compose_image_prompts(shots: list[Shot], image_prompts: dict[int, str],
-                          character: str = "") -> list[str]:
-    """Build per-shot image prompts, falling back to the standard prompt builder."""
-    results = []
-    for s in shots:
-        if s.image_generation_prompt:
-            results.append(s.image_generation_prompt)
-        elif s.image_prompt_ref and s.image_prompt_ref in image_prompts:
-            results.append(image_prompts[s.image_prompt_ref])
-        else:
-            results.append(s.prompt(character))
-    return results
-
-
 def _prompt_for_ref(image_prompts: dict, ref: int) -> str:
     """Prompts are keyed by int in memory and by str once they round-trip through state.json."""
     return image_prompts.get(ref) or image_prompts.get(str(ref)) or ""
@@ -881,9 +952,13 @@ def unique_prompts(shots: list[Shot], image_prompts: dict | None = None,
     slots: list[int] = []
     seen: dict[str, int] = {}
     for s in shots:
-        # The ref wins over the shot's own prompt: a reused ref must render as one image.
+        # The ref wins over the shot's own prompt: a reused ref must render as one image. The
+        # shot's own framing and pose are re-imposed here, so a prompt stored before these fixes
+        # (every one of them said "9:16 portrait composition" and described no body at all) still
+        # renders as its planned shot size, with the action it was planned around.
         prompt = ((_prompt_for_ref(image_prompts, s.image_prompt_ref) if s.image_prompt_ref else "")
                   or s.image_generation_prompt or s.prompt(character))
+        prompt = with_pose(reframe_composition(prompt, shot_framing(s)), s)
         index = seen.get(prompt)
         if index is None:
             index = len(ordered)
@@ -891,9 +966,6 @@ def unique_prompts(shots: list[Shot], image_prompts: dict | None = None,
             ordered.append(prompt)
         slots.append(index)
     return ordered, slots
-
-
-MIN_SHOTS = 8  # below this the cut rate drops out of the 1-3s short-form window
 
 
 def fit_shot_count(shots: list[Shot], want: int) -> list[Shot]:
@@ -1431,11 +1503,14 @@ def plan_shorts_detailed(
     # A prompt can serve several shots, so anchor by the strongest need: character if any shot
     # using that ref has the girl on screen.
     needs_character: dict[int, bool] = {}
+    framing_by_ref: dict[int, str] = {}
     for s in shots:
         if s.image_prompt_ref:
             needs_character[s.image_prompt_ref] = (
                 needs_character.get(s.image_prompt_ref, False) or s.character)
-    image_prompts = {ref: anchor_prompt(p, needs_character.get(ref, False), character)
+            framing_by_ref[s.image_prompt_ref] = shot_framing(s)
+    image_prompts = {ref: anchor_prompt(p, needs_character.get(ref, False), character,
+                                        framing_by_ref.get(ref, ""))
                      for ref, p in image_prompts.items()}
     for s in shots:
         if s.image_prompt_ref in image_prompts:

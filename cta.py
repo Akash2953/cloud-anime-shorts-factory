@@ -17,7 +17,9 @@ from __future__ import annotations
 # what makes Kokoro lift the pitch, so it is doing real work here, not decoration.
 CTA_MIDDLE = "Part {next} is already waiting for you! Subscribe so you don't miss it!"
 CTA_LAST = "There are more stories waiting for you! Subscribe to keep them coming!"
-CTA_SINGLE = "There are more stories waiting for you! Subscribe to keep them coming!"
+# A single-part story has no next part to promise, so it asks for the channel like a final part.
+# One string, two names: the export stays so callers can say which case they mean.
+CTA_SINGLE = CTA_LAST
 
 # A brighter, quicker voice than the narration. Measured on the CTA line: af_bella has a
 # spectral centroid of 1909 Hz against af_heart's 1772, so it reads as lifted and upbeat, while
@@ -25,9 +27,6 @@ CTA_SINGLE = "There are more stories waiting for you! Subscribe to keep them com
 # bump keeps it from sounding like a slowed-down narrator.
 CTA_VOICE = "af_bella"
 CTA_SPEED = 1.15
-
-# The word the block renderer swaps for a subscribe button.
-SUBSCRIBE_WORD = "subscribe"
 
 
 def cta_line(part: int, total_parts: int) -> str:
@@ -39,9 +38,7 @@ def cta_line(part: int, total_parts: int) -> str:
     """
     if total_parts > 1 and part < total_parts:
         return CTA_MIDDLE.format(next=part + 1)
-    if total_parts > 1:
-        return CTA_LAST
-    return CTA_SINGLE
+    return CTA_LAST
 
 
 def cta_shot(part: int, total_parts: int, seconds: float = 4.0):
@@ -70,7 +67,6 @@ __all__ = [
     "CTA_SINGLE",
     "CTA_SPEED",
     "CTA_VOICE",
-    "SUBSCRIBE_WORD",
     "cta_line",
     "cta_shot",
 ]

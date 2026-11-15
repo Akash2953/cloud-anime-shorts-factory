@@ -54,29 +54,6 @@ def _encode(cmd: list[str], output_path: Path, *, expected_seconds: float = 0.0,
     return False
 
 
-def _fit_filter(width: int, height: int, fit: str) -> str:
-    """Build the scale/pad chain for the chosen fill strategy.
-
-    cover   — scale up until the frame is full, then centre-crop the overflow.
-              Use when sources are square (Workers AI returns 1024x1024).
-    contain — scale to fit and letterbox with black bars.
-
-    Both force limited-range yuv420p: JPEG sources are full-range, and letting that
-    through produces yuvj420p files that render washed out or crushed on phones.
-    """
-    if fit == "cover":
-        return (
-            f"scale={width}:{height}:force_original_aspect_ratio=increase:out_range=limited,"
-            f"crop={width}:{height},setsar=1,format=yuv420p"
-        )
-    if fit == "contain":
-        return (
-            f"scale={width}:{height}:force_original_aspect_ratio=decrease:out_range=limited,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
-        )
-    raise ValueError(f"unknown fit mode: {fit}")
-
-
 def _fit_chain(width: int, height: int, fit: str) -> str:
     """scale+pad/crop chain only (no format), reusable inside bigger graphs."""
     if fit == "cover":
@@ -269,65 +246,3 @@ def render_narration(
                 audio_path.name, " + music" if has_music else "")
     return _encode(cmd, output_path, expected_seconds=total)
 
-
-def render_short(
-    image_paths: list[Path],
-    output_path: Path,
-    *,
-    duration_per_image: float = 3.0,
-    width: int = 1080,
-    height: int = 1920,
-    fit: str = "cover",
-) -> bool:
-    if not image_paths:
-        logger.error("No images provided for rendering")
-        return False
-
-    # Create temporary concat list for FFmpeg
-    concat_file = output_path.parent / "concat.txt"
-    try:
-        lines = []
-        for p in image_paths:
-            lines.append(f"file '{p.resolve()}'")
-            lines.append(f"duration {duration_per_image}")
-        # repeat last frame to hold duration
-        lines.append(f"file '{image_paths[-1].resolve()}'")
-        concat_file.write_text("\n".join(lines), encoding="utf-8")
-
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(concat_file),
-            "-vf",
-            _fit_filter(width, height, fit),
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-r",
-            "30",
-            # Tag as standard limited-range BT.709 so YouTube/phones decode colours correctly.
-            "-color_range",
-            "tv",
-            "-colorspace",
-            "bt709",
-            "-color_primaries",
-            "bt709",
-            "-color_trc",
-            "bt709",
-            "-t",
-            str(len(image_paths) * duration_per_image),
-            str(output_path),
-        ]
-
-        logger.info("Running FFmpeg: %s", " ".join(cmd))
-        return _encode(cmd, output_path,
-                       expected_seconds=len(image_paths) * duration_per_image)
-    finally:
-        if concat_file.exists():
-            concat_file.unlink()

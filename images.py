@@ -9,20 +9,24 @@ This module only decides *how* each prompt becomes an image, and degrades safely
   sheet  one character sheet (2x3 grid) cropped into panels. Identity is identical pixels.
   fresh  every shot rendered independently.
 
-Every render goes to Antigravity first when OAuth is configured, then to Workers AI if Antigravity
-cannot answer. All strategies stop on Workers AI quota/auth errors instead of hammering the API,
+Every render goes to Agnes first when an Agnes key is configured, then to Antigravity, then to
+Workers AI. All strategies stop on Workers AI quota/auth errors instead of hammering the API,
 and record what ran.
 """
 
 import base64
+import io
 import logging
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import requests
+from PIL import Image
 
+import agnes
 import gemini
 from scenes import STYLE, api_error_detail, is_quota_error
 
@@ -33,6 +37,13 @@ SCHNELL = "@cf/black-forest-labs/flux-1-schnell"
 KLEIN = "@cf/black-forest-labs/flux-2-klein-4b"
 
 VALID_STRATEGIES = ("edit", "sheet", "fresh")
+
+# A frame whose mean |Δluma| against the canonical frame is under this is a near-copy. Measured on
+# a collapsed render: five shots planned as close-up, medium, wide, close-up and medium all landed
+# at 1.5-7.1, while the shots that actually changed sat above 12. The score is 64x64 greyscale, so
+# it ignores resolution and hue and only asks "is this the same picture again".
+NEAR_COPY_DIFF = 8.0
+_THUMB_SIZE = (64, 64)
 
 # Model-level failures (switch strategy) vs spend failures (stop the run).
 _FATAL = ("auth_", "plan_restricted", "model_missing")
@@ -141,30 +152,52 @@ def generate_edit(reference: bytes, prompt: str, cfa_token: str, account_id: str
 
 
 def fresh_image(prompt: str, cfa_token: str, account_id: str, *,
-                antigravity_key: str = "") -> ImageResult:
-    """One text-to-image render: Antigravity first, Workers AI when it cannot answer.
+                antigravity_key: str = "", agnes_key: str = "") -> ImageResult:
+    """One text-to-image render: Antigravity, then Agnes, then Workers AI.
 
-    Any Antigravity refusal (unavailable model, quota, safety block, timeout) falls through to
-    Workers AI rather than failing the shot.
+    The order is the *edit* path's order, not a quality ranking. A short has to be drawn by one
+    model family or the art style changes at the cut: an Agnes canonical frame next to Antigravity
+    edits (`gemini-3.1-flash-image`) read as two different shows — darker and painterly against
+    flatter cel shading — so the provider that can render the edits also renders the frames they
+    are edited from. With no Antigravity key there is nothing to match and Agnes goes first: it
+    answers 9:16 at 2K (1472x2624) for free, where Gemini's default is 1K.
+
+    Any refusal (rate limit, quota, safety block, timeout) falls through to the next provider
+    rather than failing the shot.
     """
     if antigravity_key:
         res = gemini.image(prompt, key=antigravity_key)
         if res.ok and res.data:
             return ImageResult(ok=True, data=res.data)
-        logger.warning("Antigravity image failed (%s); falling back to Workers AI",
+        logger.warning("Antigravity image failed (%s); falling back to Agnes",
+                       res.error or "unknown")
+    if agnes_key:
+        res = agnes.image(prompt, key=agnes_key)
+        if res.ok and res.data:
+            return ImageResult(ok=True, data=res.data)
+        logger.warning("Agnes image failed (%s); falling back to Workers AI",
                        res.error or "unknown")
     return generate_fresh(prompt, cfa_token, account_id)
 
 
 def edit_image(reference: bytes, prompt: str, cfa_token: str, account_id: str, *,
                antigravity_key: str = "") -> ImageResult:
-    """One identity-conditioned edit: Antigravity first, then the Workers AI edit model."""
+    """One identity-conditioned edit: Antigravity, then the Workers AI edit model.
+
+    Antigravity first is measured, not a preference. Handed the same prompt and the same canonical
+    frame, `gemini-3.1-flash-image` re-staged the character as the shot asked — back against the
+    wall, one hand on the stone, the other on his chest, braced legs — while
+    `agnes-image-2.5-flash` returned the canonical frame again (three-quarter turn, hand out at the
+    wall). Agnes is therefore not a fallback here: an edit that cannot leave the reference's pose
+    is the defect this path exists to avoid, so its refusal sends the shot to `fresh_image`, where
+    nothing is copied and the planned action survives.
+    """
     if antigravity_key:
         res = gemini.image(prompt, key=antigravity_key, reference=reference)
         if res.ok and res.data:
             return ImageResult(ok=True, data=res.data)
-        logger.warning("Antigravity image edit failed (%s); falling back to Workers AI",
-                       res.error or "unknown")
+        logger.warning("Antigravity image edit failed (%s); not falling back to Agnes, which "
+                       "would repeat the reference's pose", res.error or "unknown")
     return generate_edit(reference, prompt, cfa_token, account_id)
 
 
@@ -254,6 +287,7 @@ def _fresh_with_retry(
     backoff_s: float | None = None,
     reserve: int = 0,
     antigravity_key: str = "",
+    agnes_key: str = "",
 ) -> tuple[ImageResult | None, str]:
     """Render one fresh image, retrying transient failures within the daily budget.
 
@@ -277,7 +311,8 @@ def _fresh_with_retry(
                            shot_no, reserve)
             return None, "failed"
         budget["attempts"] += 1
-        res = fresh_image(prompt, cfa_token, account_id, antigravity_key=antigravity_key)
+        res = fresh_image(prompt, cfa_token, account_id, antigravity_key=antigravity_key,
+                          agnes_key=agnes_key)
         if res.ok:
             if attempt > 1:
                 logger.info("shot %d: rendered on attempt %d/%d", shot_no, attempt, attempts)
@@ -295,6 +330,52 @@ def _fresh_with_retry(
     return None, "failed"
 
 
+def luma_thumb(data: bytes) -> np.ndarray | None:
+    """64x64 greyscale thumbnail of an encoded image, or None when the bytes are not decodable."""
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            return np.asarray(img.convert("L").resize(_THUMB_SIZE), dtype=np.float32)
+    except Exception:  # noqa: BLE001 — an undecodable payload must not abort a render
+        return None
+
+
+def luma_diff(a: np.ndarray | None, b: np.ndarray | None) -> float | None:
+    """Mean absolute luma difference between two thumbnails, or None if either is missing."""
+    if a is None or b is None or a.shape != b.shape:
+        return None
+    return float(np.abs(a - b).mean())
+
+
+def edit_instruction(prompt: str, character: str = "", *, strict: bool = False) -> str:
+    """Identity-conditioned edit instruction: shot first, identity last, reframing explicit.
+
+    This used to open with `Keep the EXACT same character — identical face, hair and outfit as the
+    reference image`, which made the reference the first and loudest thing in the request: Agnes
+    then reproduced the reference composition for five of eight shots planned as close-up, medium,
+    wide, close-up and medium (mean luma diff 1.5-7.1 between frames the plan had made different).
+    The lesson the plan side already learned — a leading identity paragraph collapses every frame
+    into the same portrait — holds for the edit call too. So the shot leads, identity is one
+    trailing clause, and the instruction states what has to change. `strict` is the second attempt
+    after a render came back as a near-copy of the reference.
+
+    The pose is named separately and on purpose: an edit that only says "same character" keeps the
+    reference's stance, head angle, hands and expression, which is how a short ends up with four
+    backgrounds and one body. The prompt carries the planned action as `Pose and body: …`; this
+    states that the reference supplies the design and nothing else.
+    """
+    body = " ".join((prompt or "").split()).strip()
+    ident = (f"the same character as the reference ({character})" if character
+             else "the same character as the reference")
+    redraw = ("Treat the reference as a face and costume reference only: ignore its pose, crop, "
+              "camera angle and background entirely and draw a completely different frame."
+              if strict else
+              "A new camera angle, a new framing and a different background from the reference.")
+    return (f"{body} {redraw} Carry over only {ident} — the same face, hair and outfit — and "
+            "redraw that character performing the action described above. The reference's "
+            "stance, head angle, hand position and expression are not this frame's pose and "
+            "must not be copied.")
+
+
 def produce_images(
     prompts: list[str],
     *,
@@ -306,17 +387,28 @@ def produce_images(
     character: str = "",
     budget: dict | None = None,
     antigravity_key: str = "",
+    agnes_key: str = "",
 ) -> tuple[list[Path], str]:
     """Render one image per prompt. Returns (frames, strategy_used).
 
     `character_flags[i]` marks prompts where the arc's protagonist is on screen; only those take
     part in the canonical-frame conditioning, so inserts and establishing shots stay
     independent. `character` is the arc's own identity signature, so each arc conditions on its
-    own face instead of a shared one. `antigravity_key` routes renders through Antigravity first
-    and Workers AI second; empty uses Workers AI directly.
+    own face instead of a shared one. `agnes_key` puts Agnes first (2K renders), `antigravity_key`
+    puts Antigravity next; with both empty the renders go straight to Workers AI.
     """
     if strategy not in VALID_STRATEGIES:
         logger.warning("Unknown image strategy %r, using 'fresh'", strategy)
+        strategy = "fresh"
+    if strategy == "edit" and not antigravity_key:
+        # The edit path is only as good as the model that renders it. Antigravity follows the
+        # action; Agnes reproduces the reference's pose from the identical prompt and reference
+        # (measured on the same shot: Agnes returned the canonical three-quarter turn, Gemini
+        # returned the planned back-against-the-wall), and Workers AI's editor is untested there.
+        # Without the provider that can re-stage, an edit freezes the story's body language — so
+        # render fresh and let the character signature carry the design.
+        logger.info("No Antigravity image key: rendering fresh, since an edit through the "
+                    "remaining providers repeats the reference's pose")
         strategy = "fresh"
     img_dir.mkdir(parents=True, exist_ok=True)
     budget = budget if budget is not None else {"attempts": 0, "max": 10_000}
@@ -324,6 +416,28 @@ def produce_images(
 
     def affordable() -> bool:
         return budget["attempts"] < budget["max"]
+
+    # Every frame already rendered, so a new one can be checked against all of them and not only
+    # against the canonical character frame. The canonical-only check let a shot repeat a
+    # *neighbouring* shot: measured, shot 6 came back as a near-copy of shot 2 (side view, hand
+    # out, same wall) while sitting 6.6 away from the canonical, under the guard's nose.
+    prior_thumbs: list[np.ndarray] = []
+
+    def nearest_copy(data: bytes) -> tuple[float | None, int | None]:
+        """Smallest luma difference to a frame already rendered, and that frame's ordinal."""
+        thumb = luma_thumb(data)
+        best: float | None = None
+        where: int | None = None
+        for ordinal, other in enumerate(prior_thumbs, 1):
+            diff = luma_diff(thumb, other)
+            if diff is not None and (best is None or diff < best):
+                best, where = diff, ordinal
+        return best, where
+
+    def remember(data: bytes) -> None:
+        thumb = luma_thumb(data)
+        if thumb is not None:
+            prior_thumbs.append(thumb)
 
     # --- sheet -----------------------------------------------------------------
     if strategy == "sheet" and affordable():
@@ -334,7 +448,8 @@ def produce_images(
             f"3x{(n + 2) // 3} grid of equal panels with no borders, each panel a different pose, "
             "full body, identical design in every panel.")
         budget["attempts"] += 1
-        res = fresh_image(sheet_prompt, cfa_token, account_id, antigravity_key=antigravity_key)
+        res = fresh_image(sheet_prompt, cfa_token, account_id, antigravity_key=antigravity_key,
+                          agnes_key=agnes_key)
         if res.ok:
             panels = crop_grid(_save(res.data, img_dir, 99), img_dir, n)
             if len(panels) == n:
@@ -355,7 +470,8 @@ def produce_images(
             if canonical is None or not wants_character or strategy != "edit":
                 res, reason = _fresh_with_retry(prompt, cfa_token, account_id, budget, i + 1,
                                                 reserve=len(prompts) - i - 1,
-                                                antigravity_key=antigravity_key)
+                                                antigravity_key=antigravity_key,
+                                                agnes_key=agnes_key)
                 if res is None:
                     if reason == "fatal":
                         stopped = True
@@ -369,7 +485,13 @@ def produce_images(
                     continue
                 if canonical is None and wants_character:
                     canonical = res.data
-                    logger.info("shot %d: canonical character rendered (flux-1-schnell)", i + 1)
+                    logger.info("shot %d: canonical character rendered", i + 1)
+                repeat, twin = nearest_copy(res.data)
+                if repeat is not None and repeat < NEAR_COPY_DIFF:
+                    logger.warning("shot %d: fresh render repeats frame %d (luma diff %.1f); "
+                                   "rendering it rather than holding it twice", i + 1, twin,
+                                   repeat)
+                remember(res.data)
                 frames.append(_save(res.data, img_dir, i))
                 continue
 
@@ -377,28 +499,79 @@ def produce_images(
                 logger.warning("Daily image budget exhausted (%d/%d)", budget["attempts"], budget["max"])
                 break
             budget["attempts"] += 1
-            res = edit_image(
-                canonical,
-                "Keep the EXACT same character — identical face, hair and outfit as the reference "
-                f"image. {prompt}",
-                cfa_token, account_id, antigravity_key=antigravity_key)
+            res = edit_image(canonical, edit_instruction(prompt, character),
+                             cfa_token, account_id,
+                             antigravity_key=antigravity_key)
             if res.ok:
+                diff, twin = nearest_copy(res.data)
+                if diff is not None and diff < NEAR_COPY_DIFF:
+                    logger.warning("shot %d: edit repeats frame %d (luma diff %.1f of %.0f); "
+                                   "asking again with the reference limited to identity",
+                                   i + 1, twin, diff, NEAR_COPY_DIFF)
+                    if affordable():
+                        budget["attempts"] += 1
+                        retry = edit_image(
+                            canonical, edit_instruction(prompt, character, strict=True),
+                            cfa_token, account_id, antigravity_key=antigravity_key)
+                        if retry.ok:
+                            res = retry
+                            diff, twin = nearest_copy(res.data)
+                    else:
+                        logger.warning("shot %d: no image budget left to retry the near-copy",
+                                       i + 1)
+                    if diff is not None and diff < NEAR_COPY_DIFF:
+                        # Retrying the edit rarely helps: an edit is anchored to the reference, so
+                        # it reproduces the reference's staging again. A fresh render has no
+                        # reference to copy and can actually change the body, so it is the only
+                        # remaining move that can separate two beats that look alike.
+                        logger.warning("shot %d: still a near-copy of frame %d (luma diff "
+                                       "%.1f); rendering it fresh instead", i + 1, twin, diff)
+                        if affordable():
+                            budget["attempts"] += 1
+                            fresher = fresh_image(prompt, cfa_token, account_id,
+                                                  antigravity_key=antigravity_key,
+                                                  agnes_key=agnes_key)
+                            if fresher.ok:
+                                fresh_diff, fresh_twin = nearest_copy(fresher.data)
+                                if fresh_diff is not None and fresh_diff > diff:
+                                    logger.info("shot %d: fresh render is %.1f away from its "
+                                                "closest frame", i + 1, fresh_diff)
+                                    res, diff, twin = fresher, fresh_diff, fresh_twin
+                                else:
+                                    logger.warning("shot %d: fresh render is no further from "
+                                                   "the earlier frames; keeping the edit", i + 1)
+                        else:
+                            logger.warning("shot %d: no image budget left for a fresh render",
+                                           i + 1)
+                        if diff is not None and diff < NEAR_COPY_DIFF:
+                            logger.warning("shot %d: still a near-copy of frame %d (luma diff "
+                                           "%.1f); keeping it", i + 1, twin, diff)
+                elif diff is not None:
+                    logger.info("shot %d: edit of the canonical character (closest earlier frame "
+                                "%.1f away)", i + 1, diff)
+                else:
+                    logger.info("shot %d: edit of the canonical character", i + 1)
+                remember(res.data)
                 edits += 1
                 frames.append(_save(res.data, img_dir, i))
-                logger.info("shot %d: edit of the canonical character (flux-2-klein)", i + 1)
                 continue
 
             if res.error.startswith(("quota_exhausted", "auth_")):
-                logger.error("Stopping image generation: %s", res.error)
-                stopped = True
-                break
-            logger.warning("Edit failed for shot %d (%s); rendering it fresh", i + 1, res.error)
-            if res.error.startswith(_FATAL):
+                # An exhausted edit model must not end the short: the remaining beats can still be
+                # drawn fresh, which also frees them from the reference's pose.
+                logger.warning("Edit model unavailable for shot %d (%s); rendering the rest "
+                               "fresh", i + 1, res.error)
                 strategy = "fresh"
-                logger.warning("Edit model unusable (%s); remaining shots render fresh", res.error)
+            else:
+                logger.warning("Edit failed for shot %d (%s); rendering it fresh", i + 1,
+                               res.error)
+                if res.error.startswith(_FATAL):
+                    strategy = "fresh"
+                    logger.warning("Edit model unusable (%s); remaining shots render fresh",
+                                   res.error)
             res, reason = _fresh_with_retry(prompt, cfa_token, account_id, budget, i + 1,
                                             reserve=len(prompts) - i - 1,
-                                            antigravity_key=antigravity_key)
+                                            antigravity_key=antigravity_key, agnes_key=agnes_key)
             if res is not None:
                 frames.append(_save(res.data, img_dir, i))
             elif reason == "fatal":
@@ -425,7 +598,7 @@ def produce_images(
     for i, prompt in enumerate(prompts):
         res, reason = _fresh_with_retry(prompt, cfa_token, account_id, budget, i + 1,
                                         reserve=len(prompts) - i - 1,
-                                        antigravity_key=antigravity_key)
+                                        antigravity_key=antigravity_key, agnes_key=agnes_key)
         if res is not None:
             slots.append(_save(res.data, img_dir, i))
             continue
