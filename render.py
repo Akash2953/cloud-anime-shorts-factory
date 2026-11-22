@@ -115,7 +115,7 @@ def render_narration(
       "bottom" (default) — strip centre at 75% of the canvas height (centre of the bottom half)
       "center"           — strip centre at 50% of the canvas height (centre of the frame)
     The CTA block uses "center" so the ask sits in the middle of the picture rather than in the
-    caption lane.
+    caption lane; the hook card uses "top" so the opening line sits above it.
 
     `music_path` adds a background bed: it is looped to the full length, faded in and out, and
     sidechain-ducked under the voice by `music.mix_graph`, then the whole mix is normalised to
@@ -193,8 +193,10 @@ def render_narration(
             cap_index = overlay_base + k
             out = f"[vcap{k}]"
             # "bottom" puts the strip centre at 75% of the canvas height (centre of the bottom
-            # half); "center" puts it at 50% (centre of the frame).
+            # half); "center" puts it at 50% (centre of the frame); "top" at 22%, which clears
+            # the top edge and still sits well above the caption lane.
             base_y = ("main_h/2-overlay_h/2" if anchor == "center"
+                      else "main_h*0.22-overlay_h/2" if anchor == "top"
                       else "main_h*3/4-overlay_h/2")
             y = base_y
             if animated:

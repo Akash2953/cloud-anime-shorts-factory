@@ -11,8 +11,9 @@ from scenes import (
     HOOK_MAX_WORDS, NARRATIVE_ROLES, SHOT_SIZES, STYLE, Shot, _hook_problem, _infer_character,
     _opens_with, _plan_gaps, _spoken_words, _template_shots, _total_spoken_words, anchor_prompt,
     fit_shot_count, with_pose as from_scenes_with_pose,
-    make_character, parse_detailed_response, parse_hook, parse_plan, plan_shots, reuse_image_refs,
-    shots_for_duration, unique_prompts, words_for_duration,
+    make_character, opening_line, parse_detailed_response, parse_hook, parse_plan, plan_shots,
+    reuse_image_refs, shots_for_duration, unique_prompts, words_for_duration,
+    _validate_title,
 )
 
 # The signature is now a per-arc value, not a global. Tests pin one value so the
@@ -673,6 +674,78 @@ class TestOpeningHook(unittest.TestCase):
         shots, prompts = parse_detailed_response(reply)
         gaps = _plan_gaps(reply, shots, prompts, want=4)
         self.assertTrue(any("`Hook:` line is missing" in gap for gap in gaps), gaps)
+
+
+class TestOpeningLine(unittest.TestCase):
+    """The hook card's text is read from shot 1, not from the plan's `Hook:` line.
+
+    A queued part is rendered from state.json, which stores shots rather than plan text, so a
+    card built from the plan would vanish exactly on the parts that ship.
+    """
+
+    def shot(self, narration: str) -> Shot:
+        return Shot(narration=narration, shot_size="close_up", place="a memory den",
+                    action="she kicks the door open", story_object="a vial",
+                    narrative_role="introduce_subject", camera="static", character=True,
+                    seconds=7.0)
+
+    def test_the_card_carries_the_first_sentence_of_shot_one(self):
+        hook = "The memory broker sold her childhood, and the buyer wears her face."
+        shots = [self.shot(hook + " She kicks open the den's rusted door."),
+                 self.shot("Neon bleeds through cracked tiles.")]
+        self.assertEqual(opening_line(shots), hook)
+
+    def test_a_silent_opening_beat_has_no_card(self):
+        self.assertEqual(opening_line([self.shot("none")]), "")
+        self.assertEqual(opening_line([]), "")
+
+
+class TestTitleGate(unittest.TestCase):
+    """Titles that published as working notes instead of story names.
+
+    "Anime Short #1/4 \u2014 2026-11-12" and "Anime Short #2/3 - reuse-lantern-kaito" are on the
+    channel: a format label, a date and an image strategy name, all of which describe the pipeline
+    rather than the story. A run that cannot name the story has to fall back, not ship these.
+    """
+
+    def test_pipeline_working_titles_are_not_story_names(self):
+        for title in ("Anime Short #1/4 \u2014 2026-11-12",
+                      "Anime Short #2/3 - reuse-lantern-kaito",
+                      "The Glass Storm Keeper #3/3",
+                      "reuse-lantern-kaito",
+                      "The Lantern \ufffd"):
+            self.assertEqual(_validate_title(title), "", title)
+
+    def test_a_real_story_name_survives(self):
+        for title in ("The Memory That Wore Her Face", "The Lantern She Left Burning"):
+            self.assertEqual(_validate_title(title), title)
+
+    def test_a_truncated_clause_is_still_rejected(self):
+        self.assertEqual(_validate_title("The mist clung to Oakhaven's rooftops when"), "")
+
+
+class TestGenreInPlannerPrompt(unittest.TestCase):
+    """The genre has to reach the planner, not just the log."""
+
+    def test_the_genre_and_its_light_are_in_the_request(self):
+        from unittest.mock import patch
+        from scenes import genre_by_name, plan_shorts_detailed
+        sports = genre_by_name("sports")
+        with patch("scenes._openrouter", return_value=detailed_reply(8)) as planner:
+            plan_shorts_detailed(theme="", api_key="k", want=8, genre=sports)
+        messages = planner.call_args_list[0][0][0]
+        system, user = messages[0]["content"], messages[1]["content"]
+        self.assertIn("## Genre", system)
+        self.assertIn("sports", system)
+        self.assertIn(sports.look, system)
+        self.assertIn("sports", user)
+
+    def test_no_genre_leaves_the_request_alone(self):
+        from unittest.mock import patch
+        from scenes import plan_shorts_detailed
+        with patch("scenes._openrouter", return_value=detailed_reply(8)) as planner:
+            plan_shorts_detailed(theme="", api_key="k", want=8)
+        self.assertNotIn("## Genre", planner.call_args_list[0][0][0][0]["content"])
 
 
 class TestWordCeiling(unittest.TestCase):

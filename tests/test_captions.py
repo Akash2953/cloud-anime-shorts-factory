@@ -298,5 +298,65 @@ class TestLineLevelFallback(unittest.TestCase):
             self.assertEqual(len(overlays), 1)
 
 
+class TestHookCard(unittest.TestCase):
+    """The opening sentence must be readable at 0 s, not one word at a time.
+
+    Word-synced captions show "The" on the first frame, so a viewer deciding whether to stay
+    cannot see the promise. The card is a static block anchored above the caption lane.
+    """
+
+    HOOK = "The memory broker sold her childhood, and the buyer wears her face."
+
+    def build(self, out_dir: Path, *, hook_card=None, audio_duration: float = 6.0):
+        with patch("captions.align_words", return_value=[]), \
+             patch("captions.render_group_pngs",
+                   return_value=[(out_dir / "cap_00.png", 0.0, 6.0)]):
+            return build_caption_overlays(
+                Path("n.wav"), self.HOOK + " She kicks the door.",
+                audio_duration=audio_duration, out_dir=out_dir, hook_card=hook_card)
+
+    def test_the_card_sits_at_the_top_from_frame_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            card = out_dir / "hook_card.png"
+            with patch("captions.render_hook_card", return_value=card) as render:
+                overlays = self.build(out_dir, hook_card=(self.HOOK, 0.0, 2.5))
+        self.assertEqual(overlays[0], (card, 0.0, 2.5, "top"))
+        self.assertEqual(len(overlays), 2)          # the word groups are still there
+        self.assertEqual(render.call_args[0][0], self.HOOK)
+
+    def test_the_card_never_outlives_the_track(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp)
+            with patch("captions.render_hook_card",
+                       return_value=out_dir / "hook_card.png"):
+                overlays = self.build(out_dir, hook_card=(self.HOOK, 0.0, 30.0),
+                                      audio_duration=6.0)
+        self.assertEqual(overlays[0][2], 6.0)
+
+    def test_a_failed_card_render_leaves_the_captions_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("captions.render_hook_card", return_value=None):
+                overlays = self.build(Path(tmp), hook_card=(self.HOOK, 0.0, 2.5))
+        self.assertEqual(len(overlays), 1)
+        self.assertNotIn("top", [ov[3] for ov in overlays if len(ov) > 3])
+
+    def test_no_hook_card_means_no_extra_overlay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(len(self.build(Path(tmp))), 1)
+
+    def test_the_png_is_a_full_width_block(self):
+        from captions import _resolve_font, render_hook_card
+        if not _resolve_font(None)[0]:
+            self.skipTest("no font available on this machine")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = render_hook_card(self.HOOK, Path(tmp) / "hook.png")
+            self.assertIsNotNone(path)
+            from PIL import Image  # type: ignore
+            with Image.open(path) as img:
+                self.assertEqual(img.width, 1080)
+                self.assertGreater(img.height, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

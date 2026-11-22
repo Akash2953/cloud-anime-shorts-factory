@@ -15,9 +15,9 @@ GitHub Actions (cron 12:00 UTC) — one upload per day
          │                  first character shot = canon,
          │                  later character shots = edits of it; env/insert shots render fresh
          │                  fallbacks: `sheet` (one sheet, cropped) → `fresh` (unlocked)
-         ├── Narration      Kokoro-82M TTS (local ONNX), voice af_heart
+         ├── Narration      Kokoro-82M TTS (local ONNX), voice matched to the protagonist
          ├── Render         each still held for its own line, Ken Burns, 1080x1920, AAC
-         └── Upload         YouTube Data API, private first, manual publish
+         └── Upload         YouTube Data API, public (`PUBLISH_PRIVACY` overrides)
 ```
 
 No object storage: the rendered MP4 goes straight to YouTube in the same run.
@@ -111,6 +111,13 @@ The story title is never spoken: it is the upload title, the thumbnail and the c
 Later parts also inherit the narrator: `story_so_far` pins the person and tense, which is how the
 part-2 voice flip (third person → "my palm") is meant to stop.
 
+**The hook is also on screen.** Word-synced captions reach the hook one word at a time, so at 0 s
+the frame shows "The" — too slow for a viewer deciding whether to stay. `opening_line()` takes the
+first sentence of Shot 1 from the shots themselves (not from the plan text, which `state.json`
+does not store, so a queued part still gets its card), and `captions.render_hook_card()` draws it
+as one uppercase block on a dark scrim for the first 2.5 s, anchored at 22 % of the frame height by
+`render.py`'s `top` anchor — above the caption lane, which stays at 75 %.
+
 ### Place changes
 
 When a shot's `Place` differs from the one before it, the **first clause** of that shot's narration
@@ -176,6 +183,27 @@ once published a short with no subtitles at all:
 | `faster_whisper` | **line-level captions** — one strip per beat, timed to the beat holds (`WARNING` at startup) |
 | `PIL` | no captions can be rendered (`ERROR` at startup, before image quota is spent) |
 
+### Genres: one world per story
+
+Every story draws a genre from `GENRES` in `scenes.py` — twelve worlds, each with a **story
+engine** (the pressure that makes a story) and a **look** (time of day, light, palette). A genre
+is drawn per *story*, never per part: an arc stays in the world it opened in.
+
+The reason this exists: `resolve_part` passed `theme=""`, so nothing in the request named a
+genre and the planner reused the prompt's own examples. Twelve stories in a row came back dark
+fantasy with a missing person in them. The world was never chosen, so the model chose the same
+one every time.
+
+Nothing repeats until every genre has had a turn. `next_genre()` shuffles the cycle's order with
+`random.Random("genres-N")` and returns the first name not in the current cycle's history, which
+is stored in `state.json` under `genres` (oldest first) — so the schedule is varied but
+reproducible, and a re-run cannot accidentally draw the same genre twice. `series.genre` pins the
+genre for the arc's later parts.
+
+The look is not decoration: the planner is told to put its time of day, lighting and palette in
+every image prompt, and `STYLE` no longer hard-codes `rain-lit lighting` — which had been lighting
+a daylight story like a night one and making every frame read as the same story.
+
 ### Multi-part stories
 
 A story that does not fit one short can span up to **7 parts**. Set `SERIES_PARTS` to an int
@@ -189,6 +217,17 @@ The arc is generated one part per day, appended to `state.json`, and each daily 
 next part; the queue only advances after a **successful upload**, so a failed day retries the same
 part. Parts are titled `… — Part n/N`. When the last part is uploaded the next run starts a new
 story (and, under `auto`, picks a new length).
+
+Each upload is also written to `series.published` (`{part: {video_id, title}}`), and a run refuses
+to publish a part that is already in that ledger — "The Glass Storm Keeper #1/3" once shipped
+twice because a local run's `state.json` was never committed and the next day's cron re-planned the
+same part. The ledger cannot see across machines, so a run on your laptop still needs its state
+committed before the cron fires.
+
+The upload title is a story name or nothing: `_validate_title()` rejects format labels and
+pipeline leftovers (`Anime Short …`, a date, `reuse-…`, `#`, mojibake) and a title that stops on a
+dangling word, so the run falls back to a phrase from the narration instead of publishing a
+working note.
 
 Each part is planned knowing its position: parts `1..N-1` are told *not* to resolve and must end
 on a hook (`build_tension` / `deliver_payload`), only part `N` may close on a `resolution`. The
@@ -273,6 +312,15 @@ python audio.py --say "test line"   # smoke test -> test.wav
 Available voices in the bundle: `af_heart` (default), `af_bella`, `af_sky`, `am_michael`,
 `am_fenrir`, `bm_george`, `af_nicole` — pick with `KOKORO_VOICE=am_michael`.
 
+**The narrator matches the protagonist.** `KOKORO_VOICE` defaults to `auto`: `character_gender()`
+reads the arc's character signature ("a young woman …" → female, "a boy …" → male, "a child …" →
+unstated) and `audio.narrator_voice()` draws from the matching pool, seeded by the series id. The
+voice is then pinned in `series.voice`, so every part of an arc has the same narrator; an arc that
+shipped before this existed keeps `af_heart`, the voice its part 1 already used. The call to action
+keeps the narrator's gender but takes a different voice from the same pool (`audio.cta_voice`), so
+the ask still sounds like a different register rather than a different channel. British voices
+automatically get the `en-gb` front-end.
+
 ## Prerequisites
 
 - GitHub repo with secrets configured
@@ -323,10 +371,10 @@ for a real 1080×1920 file before spending an upload.
 
 - Upload costs **1600 units** of the project's 10,000/day; `videos.update` (privacy flip) ~50.
   One short per day is nowhere near the limit — 6/day would still fit.
-- **Videos uploaded by a project YouTube hasn't audited can be locked to `private`.** The pipeline
-already uploads `private` first (see `publish.upload_video`) so nothing is published unvetted, but if
-`publish.set_privacy()` fails to make a video public, that is this restriction, not a bug — it needs
-the YouTube API Services audit, or manual publishing from YouTube Studio.
+- **Videos uploaded by a project YouTube hasn't audited can be locked to `private`.** Uploads go
+out **public** (`upload_privacy()` defaults to public; a missing or misspelled value falls back to
+public with a warning), so if a short still lands private, that is this restriction, not a bug — it
+needs the YouTube API Services audit, or manual publishing from YouTube Studio.
 - Verify once by uploading a single test video, flipping it public, then deleting it before the
 first scheduled run.
 
@@ -343,7 +391,7 @@ first scheduled run.
 | `YOUTUBE_CLIENT_ID` / `CLIENT_SECRET` / `REFRESH_TOKEN` | YouTube OAuth |
 | `OPENROUTER_API_KEY` | Story planning fallback when Antigravity refuses |
 | `AGNES_API_KEY` | Agnes AI (OpenAI-compatible) — image provider after Antigravity, and the one that renders when no Antigravity key exists; 2K `9:16` renders, free at every resolution tier today |
-| `KOKORO_VOICE` | Optional — narration voice (default `af_heart`) |
+| `KOKORO_VOICE` | Optional — narration voice; `auto` (default) matches the protagonist's gender |
 
 Local `.env` (gitignored) is read by `config.load_config()`; the same names work as GitHub
 Actions secrets or variables. The Antigravity token is sent only in the Authorization header and

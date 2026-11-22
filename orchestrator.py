@@ -18,14 +18,16 @@ from pathlib import Path
 
 import numpy as np
 
-from audio import AudioLineError, Narration, join_with_gaps, write_wav, SAMPLE_RATE
+from audio import (AudioLineError, Narration, cta_voice, join_with_gaps, narrator_voice,
+                   write_wav, SAMPLE_RATE)
 from config import load_config, Limits
 from images import load_frames, produce_images
 from publish import exchange_refresh_token, upload_thumbnail, upload_video
 from render import render_narration
 # captions is imported lazily inside run_pipeline; an offline or fast-iteration run that doesn't
 # have faster-whisper installed shouldn't pay its import cost on startup.
-from scenes import (MAX_PARTS, Shot, make_character, plan_arc, plan_shorts_detailed,
+from scenes import (MAX_PARTS, Shot, character_gender, genre_by_name, make_character, next_genre,
+                    opening_line, plan_arc, plan_shorts_detailed,
                     reuse_image_refs, shots_for_duration, title_from_line, unique_prompts,
                     _validate_title as validate_title,
                     validate_story_position, words_for_duration)
@@ -122,6 +124,47 @@ def advance_series(state: dict, uploaded_part: int) -> None:
         series["next_part"] = max(int(series.get("next_part", 0)), uploaded_part)
 
 
+def published_video(state: dict, part: int) -> str:
+    """The video id this part already went out as, or "" when it has not been published."""
+    entry = ((state.get("series") or {}).get("published") or {}).get(str(part))
+    return entry.get("video_id", "") if isinstance(entry, dict) else str(entry or "")
+
+
+def record_published(state: dict, part: int, video_id: str, title: str) -> None:
+    """Keep an upload ledger next to the queue so a published part cannot be published twice."""
+    series = state.setdefault("series", {})
+    series.setdefault("published", {})[str(part)] = {"video_id": video_id, "title": title}
+
+
+def resolve_voice(cfg: dict, series: dict, character: str) -> str:
+    """The narrator for this story, pinned the first time it is used.
+
+    An arc that shipped before voices were pinned keeps the historical default: changing the
+    narrator between part 1 and part 2 sounds like a different channel finished the story.
+    """
+    stored = str(series.get("voice") or "").strip()
+    if stored:
+        return stored
+    configured = str(cfg.get("KOKORO_VOICE") or "auto")
+    if series.get("parts") and configured.strip().lower() == "auto":
+        return "af_heart"
+    return narrator_voice(character_gender(character), seed=str(series.get("id") or ""),
+                          configured=configured)
+
+
+def upload_privacy(cfg: dict) -> str:
+    """Public unless this run explicitly asks for something else.
+
+    The channel publishes hands-off, so the default is public and a missing, empty or misspelled
+    value cannot silently publish a short as private where nobody sees it.
+    """
+    value = str(cfg.get("PUBLISH_PRIVACY") or "public").strip().lower()
+    if value not in ("public", "unlisted", "private"):
+        logger.warning("Unknown PUBLISH_PRIVACY %r; publishing public", value)
+        return "public"
+    return value
+
+
 def resolve_part(cfg: dict, state: dict, *, part: int | None = None,
                  plan_only: bool = False) -> tuple[list[Shot], int, int, dict]:
     """Return (shots, part_number, total_parts, state). Creates or extends the series as needed.
@@ -183,6 +226,16 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None,
         character = make_character(today_key())
     else:
         character = series.setdefault("character", make_character(series.get("id", "arc")))
+    # The genre is drawn per story, not per part: an arc stays in the world it opened in, and a
+    # new story takes the next genre this cycle has not used. Passing nothing (the old behaviour)
+    # left the planner with no world to write in, so every request came back dark fantasy.
+    if index == 0:
+        genre = next_genre(list(state.get("genres") or []))
+        logger.info("Story genre: %s — %s (look: %s)", genre.name, genre.engine, genre.look)
+    else:
+        genre = genre_by_name(series.get("genre", ""))
+        if genre:
+            logger.info("Story genre: %s (arc in flight)", genre.name)
     # `SERIES_PARTS=auto`: part 1 of a new story also decides how long the arc is. A series with
     # no pinned length that is already past part 1 (hand-made state) closes here instead.
     decide_arc = bool(auto and not pinned and part_number == 1 and not part)
@@ -197,6 +250,7 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None,
         theme="", character=character, api_key=cfg.get("OPENROUTER_API_KEY", ""),
         gemini_key=cfg.get("ANTIGRAVITY_API_KEY", ""),
         want=want, target_seconds=target_seconds, max_words=max_words,
+        genre=genre,
         part=part_number, total_parts=None if decide_arc else total_parts,
         story_so_far=story_so_far,
         parts_range=(int(cfg.get("PARTS_MIN") or 1), int(cfg.get("PARTS_MAX") or MAX_PARTS)),
@@ -252,12 +306,15 @@ def resolve_part(cfg: dict, state: dict, *, part: int | None = None,
         # The story's own name, used for the upload title and the thumbnail. Never the date.
         "title": plan_title,
         "character": character,  # this arc's protagonist, so it is not shared across arcs
+        "genre": genre.name if genre else "",  # the world this story is told in
         "parts": [[s.as_dict() for s in shots]],
         "total_parts": total_parts,
         "next_part": 0,  # part 1 is pending until an upload actually succeeds
         "strategy": cfg.get("IMAGE_STRATEGY", "edit"),
     }
     state["series"] = series
+    if genre:
+        state["genres"] = list(state.get("genres") or []) + [genre.name]
     logger.info("New series %s: %d part(s), part 1 of %d planned (%d shots)",
                 series["id"], total_parts, total_parts, len(shots))
     return shots, 1, total_parts, state
@@ -329,12 +386,30 @@ def run_pipeline(*, render_only: bool = False,
         logger.info("Plan-only: wrote %d shot(s), part %d/%d — stopping before images/render/upload",
                     len(shots), part_num, total_parts)
         return
+    # A part that is already on YouTube must never be uploaded a second time. This ledger lives in
+    # state.json, so it cannot see an upload from an uncommitted run on another machine (that is
+    # how "The Glass Storm Keeper #1/3" shipped twice) — but it does stop a run that re-renders a
+    # part it has already published.
+    if not render_only:
+        already = published_video(state, part_num)
+        if already:
+            logger.error("Part %d/%d is already on YouTube as %s; refusing to publish it again. "
+                         "Delete that video and remove series.published[\"%d\"] from state.json "
+                         "to re-publish.", part_num, total_parts, already, part_num)
+            return
     target_seconds = cfg.get("PREFERRED_SECONDS") or (cfg["MIN_SECONDS"] + cfg["MAX_SECONDS"]) // 2
     strategy = cfg.get("IMAGE_STRATEGY", "edit")
     # The arc's own protagonist. For state written before a character was pinned, regenerate it
     # deterministically from the arc id so an old run still conditions on one consistent face.
     character = ((state.get("series") or {}).get("character")
                  or make_character((state.get("series") or {}).get("id", "arc")))
+    series = state.get("series") or {}
+    voice = resolve_voice(cfg, series, character)
+    if series:
+        series["voice"] = voice   # pinned, so part 2 is read by part 1's narrator
+        state["series"] = series
+    logger.info("Narrator voice: %s (protagonist %s)",
+                voice, character_gender(character) or "gender unstated")
 
     img_dir = Path("build/frames")
     max_image_attempts = int(cfg.get("MAX_IMAGE_ATTEMPTS") or Limits.max_image_attempts_per_day)
@@ -404,7 +479,7 @@ def run_pipeline(*, render_only: bool = False,
         cta_index = len(shots) - 1
         logger.info("CTA beat: %r", cta.speech)
 
-    narration_tts = Narration(voice=cfg["KOKORO_VOICE"])
+    narration_tts = Narration(voice=voice)
     speech = [shot.speech for shot in shots]
 
     # The CTA is synthesised first, in its own voice, so the story lines can be paced into
@@ -413,14 +488,15 @@ def run_pipeline(*, render_only: bool = False,
     # failing the short — it is the one beat whose absence costs nothing.
     cta_audio = None
     if cta_index is not None and speech[cta_index]:
-        from cta import CTA_SPEED, CTA_VOICE
+        from cta import CTA_SPEED
+        ask_voice = cta_voice(voice, configured=str(cfg.get("CTA_VOICE") or "auto"))
         try:
             cta_audio = narration_tts.line(
                 speech[cta_index], label="CTA",
-                voice=cfg.get("CTA_VOICE") or CTA_VOICE,
+                voice=ask_voice,
                 speed=float(cfg.get("CTA_SPEED") or CTA_SPEED))
             logger.info("CTA voice=%s speed=%.2f, %.1fs",
-                        cfg.get("CTA_VOICE") or CTA_VOICE,
+                        ask_voice,
                         float(cfg.get("CTA_SPEED") or CTA_SPEED),
                         len(cta_audio) / SAMPLE_RATE)
         except AudioLineError as exc:
@@ -518,7 +594,7 @@ def run_pipeline(*, render_only: bool = False,
     overlays: list[tuple[Path, float, float]] | None = None
     if cfg.get("WORD_CAPTIONS", True):
         try:
-            from captions import build_caption_overlays, DEFAULT_ACCENT_PALETTE
+            from captions import build_caption_overlays, DEFAULT_ACCENT_PALETTE, HOOK_CARD_SECONDS
             nar_text = " ".join(s.speech for s in shots if s.speech).strip()
             cap_dir = Path("build/captions")
             # The CTA is shown as one static centred block with a subscribe button, not as
@@ -535,6 +611,9 @@ def run_pipeline(*, render_only: bool = False,
                 if shot.speech:
                     caption_segments.append((shot.speech, beat_start, beat_end))
                 beat_start = beat_end
+            # The opening sentence is on screen from the first frame: word-synced captions
+            # reach it one word at a time, which is too slow for the swipe decision.
+            hook = opening_line(shots)
             overlays = build_caption_overlays(
                 audio_path,
                 nar_text,
@@ -545,6 +624,7 @@ def run_pipeline(*, render_only: bool = False,
                 whisper_model=cfg.get("WHISPER_MODEL", "base.en"),
                 gap_tight_ms=int(cfg.get("WORD_GAP_MS", 350)),
                 cta_block=cta_block,
+                hook_card=(hook, 0.0, HOOK_CARD_SECONDS) if hook else None,
                 segments=caption_segments,
             )
             logger.info("Captions: %d overlay PNGs prepared", len(overlays))
@@ -581,7 +661,8 @@ def run_pipeline(*, render_only: bool = False,
             "rainy city", "vertical video"]
     description = story_description(shots, part_num, total_parts, tags=tags,
                                     music_credit=music_credit or "")
-    privacy = cfg.get("PUBLISH_PRIVACY", "private")
+    privacy = upload_privacy(cfg)
+    logger.info("Upload visibility: %s (title %r)", privacy, title)
     video_id = upload_video(video_path.read_bytes(), title, description, access_token,
                             privacy_status=privacy, tags=tags)
     if not video_id:
@@ -603,6 +684,7 @@ def run_pipeline(*, render_only: bool = False,
     daily = state.setdefault("daily", {}).setdefault(today_key(), {})
     daily["uploads"] = daily.get("uploads", 0) + 1
     advance_series(state, part_num)
+    record_published(state, part_num, video_id, title)
     Path("state.json").write_text(save_state(state), encoding="utf-8")
     logger.info("Uploaded %s; daily uploads=%d/%d, strategy=%s, next_part=%s",
                 video_id, daily["uploads"], Limits.max_daily_uploads, strategy,

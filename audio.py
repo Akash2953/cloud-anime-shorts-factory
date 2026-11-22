@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import random
 import time
 import urllib.request
 from pathlib import Path
@@ -32,6 +33,47 @@ VOICE_URL = "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/resolve/
 
 # English voices that suit narration. Style matrices are 510x1x256 float32.
 DEFAULT_VOICES: tuple[str, ...] = ("af_heart", "am_michael", "af_bella", "am_fenrir")
+
+# The voices packed into voices-v1.0.bin, split by the gender they read as. A narrator has to
+# sound like the protagonist, so the story's voice is drawn from the matching pool instead of
+# every short being read by the same American woman.
+VOICES_BY_GENDER: dict[str, tuple[str, ...]] = {
+    "female": ("af_heart", "af_bella", "af_nicole", "af_sky"),
+    "male": ("am_michael", "am_fenrir", "bm_george"),
+}
+
+
+def narrator_voice(gender: str, *, seed: str = "", configured: str = "") -> str:
+    """The voice that reads a story: matched to the protagonist, stable for the story.
+
+    `configured` is the explicit KOKORO_VOICE setting and wins when it names a real voice;
+    "auto" (the default) means match the protagonist's gender. The pick is seeded by the series
+    id, so every part of an arc is told by the same narrator without needing to store one.
+    """
+    if configured and configured.strip().lower() != "auto":
+        return configured.strip()
+    pool = VOICES_BY_GENDER.get(gender or "", ())
+    if not pool:
+        return "af_heart"
+    return random.Random(f"voice-{seed or gender}").choice(pool)
+
+
+def cta_voice(narrator: str, *, configured: str = "") -> str:
+    """The call-to-action voice: same gender as the narrator, a different voice.
+
+    The ask is deliberately not read in the storyteller's tone — but a female ask after a male
+    narrator sounds like a different channel interrupted the short.
+    """
+    if configured and configured.strip().lower() != "auto":
+        return configured.strip()
+    gender = next((g for g, pool in VOICES_BY_GENDER.items() if narrator in pool), "female")
+    pool = [v for v in VOICES_BY_GENDER[gender] if v != narrator]
+    return pool[0] if pool else narrator
+
+
+def voice_language(voice: str) -> str:
+    """Kokoro's language code for a voice: `b*` voices are British, the rest American."""
+    return "en-gb" if (voice or "").startswith("b") else "en-us"
 
 # A line counts as voiced only if it has some length and some signal. Kokoro occasionally hands
 # back an empty array, or a whisper of DC offset, for a line it failed to voice — and a beat with
@@ -127,7 +169,7 @@ class Narration:
             text,
             voice=voice or self.voice,
             speed=self.speed if speed is None else speed,
-            lang="en-us",
+            lang=voice_language(voice or self.voice),
         )
         if sr != SAMPLE_RATE:
             raise RuntimeError(f"unexpected sample rate {sr}")

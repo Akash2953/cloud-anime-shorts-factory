@@ -37,6 +37,11 @@ DEFAULT_LEAD_IN_MS: int = 40
 DEFAULT_TAIL_MS: int = 100
 DEFAULT_OVERLAP_MS: int = 20
 
+# The hook card: the opening sentence held as one readable block at the top of the picture while
+# the narrator speaks it. Word-synced captions put one word on screen at a time, so at 0 s the
+# frame shows "The" — a viewer deciding in that first second has to read the promise at a glance.
+HOOK_CARD_SECONDS: float = 2.5
+
 # Stopwords cover the example case directly: "she ran towards" -> she=stop, ran=accent, towards=stop.
 STOPWORDS: frozenset[str] = frozenset({
     # articles / determiners
@@ -782,6 +787,91 @@ def render_cta_block(
     return out_path
 
 
+def render_hook_card(
+    text: str,
+    out_path: Path,
+    *,
+    font_path: str | None = None,
+    canvas_width: int = 1080,
+    font_size: int = 78,
+    margin_x: int = 70,
+) -> Path | None:
+    """Render the opening sentence as one block that can be read in a single glance.
+
+    Unlike the word-synced captions this is not timed word by word: the hook is one promise, and
+    splitting it into 2-3 word flashes hides it from a viewer who is still deciding whether to
+    stay. It sits at the top of the frame (render.py anchors it), clear of the caption lane.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # type: ignore
+    except ImportError:
+        logger.info("Pillow not installed; cannot render the hook card")
+        return None
+
+    body = " ".join((text or "").split()).strip().upper()
+    if not body:
+        return None
+    chosen, source = _resolve_font(font_path)
+    if not chosen:
+        logger.warning("no hook-card font found; skipping the card")
+        return None
+
+    max_width = canvas_width - 2 * margin_x
+
+    def wrap(size: int):
+        font = ImageFont.truetype(chosen, size)
+        space = int(font.getlength(" "))
+        lines: list[list[tuple[str, int]]] = [[]]
+        used = 0
+        for word in body.split():
+            w = int(font.getlength(word))
+            need = w if not lines[-1] else used + space + w
+            if lines[-1] and need > max_width:
+                lines.append([])
+                need = w
+            lines[-1].append((word, w))
+            used = need
+        return font, space, lines
+
+    size = font_size
+    font, space, lines = wrap(size)
+    # Shrink until the promise fits in four lines: a hook that needs five is not a glance.
+    while size > 36 and len(lines) > 4:
+        size -= 4
+        font, space, lines = wrap(size)
+    if len(lines) > 4:
+        logger.info("Hook card skipped: the opening line will not fit in four lines")
+        return None
+
+    ascent, descent = font.getmetrics()
+    text_h = ascent + descent
+    line_h = int(text_h * 1.2)
+    block_h = line_h * len(lines) + 32
+    img = Image.new("RGBA", (canvas_width, block_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    # The card lands on whatever the artist drew at the top of the frame, so it needs its own
+    # floor to stay legible: a soft scrim, the same treatment as the CTA block.
+    draw.rounded_rectangle([30, 2, canvas_width - 30, block_h - 2], radius=24,
+                           fill=(0, 0, 0, 140))
+    y = 16
+    for line in lines:
+        total = sum(w for _, w in line) + space * (len(line) - 1)
+        x = (canvas_width - total) / 2
+        text_y = y + (line_h - text_h) / 2
+        for word, w in line:
+            for off in ((0, 4), (0, 2), (1, 1)):
+                draw.text((x + off[0], text_y + off[1]), word, font=font, fill=(0, 0, 0, 150))
+            draw.text((x, text_y), word, font=font, fill=(255, 255, 255, 255),
+                      stroke_width=max(4, size // 14), stroke_fill=(0, 0, 0, 255))
+            x += w + space
+        y += line_h
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path, format="PNG")
+    logger.info("Hook card written: %s (%d line(s), %s font)", out_path, len(lines), source)
+    return out_path
+
+
 def _measure_button(draw, height: int, font_path: str, *, label: str = "SUBSCRIBE") -> int:
     """Width the subscribe button will occupy, so layout can wrap around it."""
     from PIL import ImageFont  # type: ignore
@@ -852,6 +942,7 @@ def build_caption_overlays(
     long_word_ms: int = DEFAULT_LONG_WORD_MS,
     max_group: int = DEFAULT_MAX_GROUP,
     cta_block: tuple[str, float, float] | None = None,
+    hook_card: tuple[str, float, float] | None = None,
     segments: list[tuple[str, float, float]] | None = None,
 ) -> list[tuple[Path, float, float]]:
     """End-to-end: align -> filter -> pack -> render. Never returns empty when there is speech.
@@ -859,6 +950,10 @@ def build_caption_overlays(
     `cta_block` is (text, start_s, end_s): the CTA is rendered as one static centred block with
     a subscribe button instead of word-synced groups, and any word group that falls inside that
     window is dropped so the two never overlap.
+
+    `hook_card` is (text, start_s, end_s): the opening sentence as one static block at the top of
+    the frame. It does not replace the word-synced groups underneath it — the card is what a
+    viewer reads at a glance, the groups are what they hear word by word.
 
     `segments` is (text, start_s, end_s) per spoken beat. It is only used by the line-level
     fallback, which runs when word alignment is unavailable.
@@ -899,6 +994,16 @@ def build_caption_overlays(
 
     if cta_block:
         overlays = _apply_cta_block(overlays, cta_block, out_dir, font_path)
+
+    if hook_card:
+        hook_text, hook_start, hook_end = hook_card
+        if audio_duration > 0:
+            hook_end = min(hook_end, audio_duration)
+        if hook_end > hook_start:
+            card_path = render_hook_card(hook_text, out_dir / "hook_card.png", font_path=font_path)
+            if card_path:
+                # "top" anchors it out of the caption lane, which render.py puts at 75% height.
+                overlays.insert(0, (card_path, hook_start, hook_end, "top"))
 
     return overlays
 

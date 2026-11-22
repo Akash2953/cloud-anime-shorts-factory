@@ -77,7 +77,7 @@ jobs:
           YOUTUBE_CLIENT_ID: ${{ secrets.YOUTUBE_CLIENT_ID }}
           YOUTUBE_CLIENT_SECRET: ${{ secrets.YOUTUBE_CLIENT_SECRET }}
           YOUTUBE_REFRESH_TOKEN: ${{ secrets.YOUTUBE_REFRESH_TOKEN }}
-          KOKORO_VOICE: ${{ vars.KOKORO_VOICE || 'af_heart' }}
+          KOKORO_VOICE: ${{ vars.KOKORO_VOICE || 'auto' }}
           IMAGE_STRATEGY: ${{ vars.IMAGE_STRATEGY || 'edit' }}
           # Word-synced captions: on/off via var; defaults on. Override ACCENT_PALETTE in
           # CSV form if you want to rebrand.
@@ -103,7 +103,7 @@ jobs:
           SERIES_PARTS: ${{ vars.SERIES_PARTS || '1' }}
           PARTS_MIN: ${{ vars.PARTS_MIN || '1' }}
           PARTS_MAX: ${{ vars.PARTS_MAX || '7' }}
-          PUBLISH_PRIVACY: ${{ vars.PUBLISH_PRIVACY || 'private' }}
+          PUBLISH_PRIVACY: ${{ vars.PUBLISH_PRIVACY || 'public' }}
           SHOTS_PER_PART: ${{ vars.SHOTS_PER_PART || '0' }}
           PREFERRED_SECONDS: ${{ vars.PREFERRED_SECONDS || '55' }}
           MIN_SECONDS: ${{ vars.MIN_SECONDS || '45' }}

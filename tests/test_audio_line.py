@@ -15,8 +15,9 @@ from unittest.mock import patch
 import numpy as np
 
 import audio
-from audio import AudioLineError, Narration, SAMPLE_RATE
-from scenes import _template_shots
+from audio import (AudioLineError, Narration, SAMPLE_RATE, VOICES_BY_GENDER, cta_voice,
+                   narrator_voice, voice_language)
+from scenes import character_gender, _template_shots
 
 CFG = {
     "KOKORO_VOICE": "af_heart", "PREFERRED_SECONDS": 55.0, "MIN_SECONDS": 45.0,
@@ -178,6 +179,54 @@ class TestPipelineAbortsOnAMissingLine(unittest.TestCase):
         self.assertTrue(render.called)
         frames = render.call_args.args[0]
         self.assertEqual(len(frames), 3)                   # the CTA beat is gone, the story is not
+
+
+class TestNarratorVoice(unittest.TestCase):
+    """The narrator has to sound like the protagonist, and stay the same narrator across parts.
+
+    Every short used to be read by the same American woman (af_heart) whatever the character was,
+    because KOKORO_VOICE defaulted to one fixed voice.
+    """
+
+    def test_the_signature_decides_the_gender(self):
+        self.assertEqual(character_gender("a girl in a black hooded raincoat"), "female")
+        self.assertEqual(character_gender("a young woman in a chef's apron over a black shirt"),
+                         "female")
+        self.assertEqual(character_gender("a boy in a track jacket"), "male")
+        self.assertEqual(character_gender("a man in a pilot's flight suit"), "male")
+
+    def test_a_child_or_empty_signature_states_no_gender(self):
+        self.assertEqual(character_gender("a child in a red trench coat"), "")
+        self.assertEqual(character_gender(""), "")
+
+    def test_a_male_protagonist_gets_a_male_narrator(self):
+        voice = narrator_voice("male", seed="2026-01-01")
+        self.assertIn(voice, VOICES_BY_GENDER["male"])
+
+    def test_the_pick_is_stable_for_a_story(self):
+        self.assertEqual(narrator_voice("male", seed="arc-7"), narrator_voice("male", seed="arc-7"))
+
+    def test_auto_means_match_and_a_real_name_overrides(self):
+        self.assertIn(narrator_voice("female", seed="s", configured="auto"),
+                      VOICES_BY_GENDER["female"])
+        self.assertEqual(narrator_voice("male", seed="s", configured="af_sky"), "af_sky")
+
+    def test_an_unstated_gender_falls_back_to_the_default_voice(self):
+        self.assertEqual(narrator_voice("", seed="s"), "af_heart")
+
+    def test_the_cta_keeps_the_narrator_gender_but_not_the_voice(self):
+        for narrator in ("af_heart", "am_michael", "bm_george"):
+            ask = cta_voice(narrator)
+            pool = next(p for p in VOICES_BY_GENDER.values() if narrator in p)
+            self.assertIn(ask, pool)
+            self.assertNotEqual(ask, narrator)
+
+    def test_a_configured_cta_voice_wins(self):
+        self.assertEqual(cta_voice("am_michael", configured="af_sky"), "af_sky")
+
+    def test_british_voices_get_the_british_language_code(self):
+        self.assertEqual(voice_language("bm_george"), "en-gb")
+        self.assertEqual(voice_language("af_heart"), "en-us")
 
 
 if __name__ == "__main__":

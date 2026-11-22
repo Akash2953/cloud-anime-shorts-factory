@@ -118,6 +118,15 @@ class TestPipelineCleanup(unittest.TestCase):
              patch("orchestrator.exchange_refresh_token", return_value="token"), \
              patch("orchestrator.upload_video", return_value=video_id):
             run_pipeline(reuse_frames=True)
+        return state
+
+    def test_a_successful_upload_is_written_to_the_ledger(self):
+        state = self.run_pipeline(video_id="abc123")
+        self.assertEqual(state["series"]["published"]["1"]["video_id"], "abc123")
+
+    def test_a_failed_upload_is_not_in_the_ledger(self):
+        state = self.run_pipeline(video_id=None)
+        self.assertNotIn("published", state["series"])
 
     def test_a_successful_upload_clears_the_artifacts(self):
         self.run_pipeline(video_id="abc123")

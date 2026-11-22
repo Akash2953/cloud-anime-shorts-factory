@@ -83,8 +83,9 @@ def load_config() -> dict:
         "YOUTUBE_CLIENT_ID": os.environ.get("YOUTUBE_CLIENT_ID", ""),
         "YOUTUBE_CLIENT_SECRET": os.environ.get("YOUTUBE_CLIENT_SECRET", ""),
         "YOUTUBE_REFRESH_TOKEN": os.environ.get("YOUTUBE_REFRESH_TOKEN", ""),
-        # private until you trust the output; set to "public" for hands-off publishing.
-        "PUBLISH_PRIVACY": os.environ.get("PUBLISH_PRIVACY", "private").lower(),
+        # public: the channel publishes hands-off, one short a day. Set "unlisted" or "private"
+        # only for a deliberate test upload.
+        "PUBLISH_PRIVACY": os.environ.get("PUBLISH_PRIVACY", "public").lower(),
         # The sentinel selects the OAuth refresh flow without exposing the refresh token to
         # provider-selection code. A supplied access token or API key is used directly.
         "ANTIGRAVITY_API_KEY": antigravity_api_key,
@@ -101,7 +102,7 @@ def load_config() -> dict:
         "AGNES_API_KEY": os.environ.get("AGNES_API_KEY", ""),
         "AGNES_IMAGE_MODEL": os.environ.get("AGNES_IMAGE_MODEL", ""),
         "AGNES_IMAGE_SIZE": os.environ.get("AGNES_IMAGE_SIZE", ""),
-        "KOKORO_VOICE": os.environ.get("KOKORO_VOICE", "af_heart"),
+        "KOKORO_VOICE": os.environ.get("KOKORO_VOICE", "auto"),
         # Daily image ceiling. 16 = one image per beat for the longest short (13-16 shots), so
         # reuse only kicks in above that. Raise for interactive development.
         "MAX_IMAGE_ATTEMPTS": os.environ.get("MAX_IMAGE_ATTEMPTS") or 16,
@@ -145,7 +146,7 @@ def load_config() -> dict:
         "CTA_SECONDS": float(os.environ.get("CTA_SECONDS", 4.0)),
         # The CTA is spoken by a brighter, faster voice than the narration so it does not read
         # as one more story beat. af_bella is measurably brighter than af_heart (see cta.py).
-        "CTA_VOICE": os.environ.get("CTA_VOICE", "af_bella"),
+        "CTA_VOICE": os.environ.get("CTA_VOICE", "auto"),
         "CTA_SPEED": float(os.environ.get("CTA_SPEED", 1.15)),
         # Custom thumbnail: burn the story title onto the key frame and upload it.
         "THUMBNAIL": os.environ.get("THUMBNAIL", "true").lower() == "true",

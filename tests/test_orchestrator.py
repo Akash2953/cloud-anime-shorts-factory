@@ -11,10 +11,11 @@ from unittest.mock import patch
 import numpy as np
 
 from orchestrator import (
-    advance_series, beat_track, caption_preflight, resolve_part, story_description,
-    story_upload_title,
+    advance_series, beat_track, caption_preflight, published_video, record_published,
+    resolve_part, resolve_voice, run_pipeline, story_description, story_upload_title,
+    upload_privacy,
 )
-from scenes import Shot, _template_shots, words_for_duration
+from scenes import GENRES, Shot, genre_by_name, next_genre, _template_shots, words_for_duration
 
 CFG = {
     "CFAI_TOKEN": "token", "CF_ACCOUNT_ID": "account", "OPENROUTER_API_KEY": "key",
@@ -75,6 +76,76 @@ class TestBeatTrack(unittest.TestCase):
     def test_a_zero_length_beat_still_gets_a_frame(self):
         _, _, holds = beat_track([self.beat("none", 0.0)], [])
         self.assertGreaterEqual(holds[0], 0.8)
+
+
+class TestGenreRotation(unittest.TestCase):
+    """Twelve stories in a row came back dark fantasy with a missing person in them.
+
+    The cause was an empty `theme`: the planner had no world to write in, so it reused the
+    prompt's own examples. A genre is now drawn per story, with a story engine and the light the
+    frames are lit by, and nothing repeats until the whole cycle has had a turn.
+    """
+
+    def test_every_genre_gets_a_turn_before_any_repeats(self):
+        history, seen = [], []
+        for _ in range(len(GENRES)):
+            genre = next_genre(history)
+            history.append(genre.name)
+            seen.append(genre.name)
+        self.assertEqual(len(set(seen)), len(GENRES))
+
+    def test_the_next_cycle_draws_a_different_order(self):
+        history = [g.name for g in GENRES]
+        second = []
+        for _ in range(len(GENRES)):
+            genre = next_genre(history)
+            history.append(genre.name)
+            second.append(genre.name)
+        self.assertEqual(sorted(second), sorted(g.name for g in GENRES))
+        self.assertNotEqual(second, [g.name for g in GENRES])
+
+    def test_a_genre_name_maps_back_to_its_world(self):
+        self.assertEqual(genre_by_name("sports").name, "sports")
+        self.assertIsNone(genre_by_name(""))
+        self.assertIsNone(genre_by_name("a genre that does not exist"))
+
+    def test_new_story_draws_a_genre_and_records_it(self):
+        state = {"processed": [], "daily": {}}
+        with patch("orchestrator.plan_shorts_detailed",
+                   return_value=(plan(13), {}, False, 1)) as planner:
+            resolve_part(CFG, state)
+        drawn = planner.call_args.kwargs["genre"]
+        self.assertIsNotNone(drawn)
+        self.assertEqual(state["series"]["genre"], drawn.name)
+        self.assertEqual(state["genres"], [drawn.name])
+
+    def test_a_second_story_draws_a_different_genre(self):
+        first = {"processed": [], "daily": {}}
+        with patch("orchestrator.plan_shorts_detailed",
+                   return_value=(plan(13), {}, False, 1)):
+            resolve_part(CFG, first)
+        second = {"processed": [], "daily": {}, "genres": first["genres"]}
+        with patch("orchestrator.plan_shorts_detailed",
+                   return_value=(plan(13), {}, False, 1)) as planner:
+            resolve_part(CFG, second)
+        self.assertNotEqual(planner.call_args.kwargs["genre"].name, first["genres"][0])
+
+    def test_a_later_part_stays_in_the_world_the_arc_opened_in(self):
+        state = series_state(parts=1, next_part=1)
+        state["series"].update(total_parts=3, genre="sports")
+        with patch("orchestrator.plan_shorts_detailed",
+                   return_value=(plan(13), {}, False, 1)) as planner:
+            resolve_part(CFG, state)
+        self.assertEqual(planner.call_args.kwargs["genre"].name, "sports")
+        self.assertNotIn("genres", state)   # the arc does not spend a second genre slot
+
+    def test_an_arc_planned_before_genres_existed_still_plans(self):
+        state = series_state(parts=1, next_part=1)
+        state["series"].update(total_parts=3)
+        with patch("orchestrator.plan_shorts_detailed",
+                   return_value=(plan(13), {}, False, 1)) as planner:
+            resolve_part(CFG, state)
+        self.assertIsNone(planner.call_args.kwargs["genre"])
 
 
 class TestSeriesParts(unittest.TestCase):
@@ -321,6 +392,78 @@ class TestAdvanceSeries(unittest.TestCase):
         state = {"processed": [], "daily": {}}
         advance_series(state, 1)
         self.assertNotIn("series", state)
+
+
+class TestUploadLedger(unittest.TestCase):
+    """A part that is already on YouTube must not be uploaded a second time.
+
+    "The Glass Storm Keeper #1/3" shipped twice because a local run's state was never committed,
+    so the next day's cron re-planned the same part. The ledger cannot see across machines, but it
+    does stop a run from re-publishing a part whose upload it recorded.
+    """
+
+    def published_state(self) -> dict:
+        return {"processed": [], "daily": {}, "series": {
+            "id": "2026-11-15", "parts": [[{}]], "next_part": 0, "total_parts": 3,
+            "published": {"1": {"video_id": "ny9S4RLqRXU",
+                                 "title": "The Glass Storm Keeper"}}}}
+
+    def test_the_ledger_round_trips(self):
+        state = {"series": {}}
+        record_published(state, 2, "vid42", "A Story")
+        self.assertEqual(published_video(state, 2), "vid42")
+
+    def test_state_written_before_the_ledger_has_no_entries(self):
+        self.assertEqual(published_video({}, 1), "")
+        self.assertEqual(published_video({"series": {"parts": [[{}]]}}, 1), "")
+
+    def test_the_pipeline_refuses_the_second_upload_of_a_part(self):
+        state = self.published_state()
+        with patch("orchestrator.load_config", return_value=CFG), \
+             patch("orchestrator.load_state", return_value=state), \
+             patch("orchestrator.resolve_part", return_value=(plan(3), 1, 3, state)), \
+             patch("orchestrator.produce_images") as images, \
+             self.assertLogs("orchestrator", level="ERROR") as logs:
+            run_pipeline()
+        images.assert_not_called()
+        self.assertIn("already on YouTube", "\n".join(logs.output))
+
+
+class TestNarratorPinning(unittest.TestCase):
+    """One arc, one narrator: a new story matches the protagonist, an old arc keeps its voice."""
+
+    def test_a_new_story_matches_a_male_protagonist(self):
+        voice = resolve_voice({"KOKORO_VOICE": "auto"}, {"id": "2026-01-01"}, "a boy in a track jacket")
+        self.assertTrue(voice.startswith("am_") or voice.startswith("bm_"))
+
+    def test_an_arc_that_shipped_before_pinning_keeps_the_old_default(self):
+        series = {"id": "2026-11-22", "parts": [[{}]], "voice": ""}
+        self.assertEqual(resolve_voice({"KOKORO_VOICE": "auto"}, series,
+                                       "a young woman in a chef's apron"), "af_heart")
+
+    def test_a_stored_voice_is_never_redrawn(self):
+        series = {"id": "x", "parts": [[{}]], "voice": "am_fenrir"}
+        self.assertEqual(resolve_voice({"KOKORO_VOICE": "auto"}, series, "a girl"), "am_fenrir")
+
+    def test_an_explicit_setting_still_wins(self):
+        self.assertEqual(resolve_voice({"KOKORO_VOICE": "af_bella"}, {"id": "x"}, "a boy"),
+                         "af_bella")
+
+
+class TestUploadVisibility(unittest.TestCase):
+    """The channel publishes hands-off, so a missing setting must not silently mean private."""
+
+    def test_missing_setting_publishes_public(self):
+        self.assertEqual(upload_privacy({}), "public")
+
+    def test_blank_and_misspelled_values_publish_public(self):
+        self.assertEqual(upload_privacy({"PUBLISH_PRIVACY": "  "}), "public")
+        with self.assertLogs("orchestrator", level="WARNING"):
+            self.assertEqual(upload_privacy({"PUBLISH_PRIVACY": "pubic"}), "public")
+
+    def test_an_explicit_test_upload_is_respected(self):
+        self.assertEqual(upload_privacy({"PUBLISH_PRIVACY": "UNLISTED"}), "unlisted")
+        self.assertEqual(upload_privacy({"PUBLISH_PRIVACY": "private"}), "private")
 
 
 class TestCaptionPreflight(unittest.TestCase):

@@ -76,8 +76,84 @@ CAMERA_MOVES = (
 
 STYLE = (
     "Anime key visual, 2D cel-shaded illustration, clean bold lineart, saturated flat colours, "
-    "cinematic rain-lit lighting, no text, no watermark"
+    "cinematic lighting, no text, no watermark"
 )
+
+
+@dataclass(frozen=True)
+class Genre:
+    """One kind of anime short: its story pressure and the light the frames are lit by.
+
+    `look` is not decoration. The image prompts carry time of day, lighting and palette, so a
+    genre whose light is never stated comes back as another night in the rain — which is how
+    every story on the channel ended up dark fantasy with a missing person in it.
+    """
+
+    name: str
+    engine: str
+    look: str
+
+
+# A cycle of twelve worlds over which no story repeats a genre. Order is reshuffled each cycle,
+# so the schedule is varied without ever drawing the same genre twice in a row.
+GENRES: tuple[Genre, ...] = (
+    Genre("shonen action",
+          "a fighter who has just been outclassed has one round left against the person who "
+          "trained them",
+          "hard daylight, high contrast, dust and speed lines, saturated primaries"),
+    Genre("slice of life",
+          "one ordinary afternoon where a small kindness changes someone's whole week",
+          "warm late-afternoon sun, soft shadows, muted pastels, lived-in rooms"),
+    Genre("school romance",
+          "two people who almost say the thing out loud, and the interruption neither chose",
+          "golden hour, summer haze, warm skin tones, shallow depth of field"),
+    Genre("sports",
+          "the last minute of a match, one exhausted player, one decision that decides it",
+          "bright stadium light, sweat and chalk dust, low dynamic angles, team colours"),
+    Genre("comedy",
+          "a plan that goes wrong in exactly the way the character has earned",
+          "flat bright daylight, bold saturated colour, exaggerated expressions, clean rooms"),
+    Genre("supernatural horror",
+          "something in the house has learned the character's routine and is waiting for it",
+          "cold blue night, hard practical light, deep black shadow, wet surfaces"),
+    Genre("sci-fi mecha",
+          "a pilot and a machine that has started making its own decisions",
+          "industrial grey, hot cockpit glow, hard rim light, sodium haze, screens"),
+    Genre("heist thriller",
+          "one job, one guard, and one thing nobody put in the plan",
+          "neon night, wet asphalt, hard practicals, long-lens compression"),
+    Genre("historical samurai",
+          "a promise made in a courtyard that cannot be kept without loss",
+          "overcast period light, earth and indigo, paper and wood, low mist"),
+    Genre("magical girl",
+          "the power arrives on the worst possible day, and it asks for something back",
+          "pastel twilight, sparkle highlights, candy palette, soft bloom"),
+    Genre("fantasy adventure",
+          "a map that ends exactly where the character needs to go, and cannot be read",
+          "open daylight fantasy, green and gold, painted skies, weather in the frame"),
+    Genre("cooking",
+          "one dish that has to come out right for one person, and does not",
+          "warm kitchen light, steam, close textures, rich reds and browns"),
+)
+
+
+def next_genre(history: list[str]) -> Genre:
+    """The first genre this cycle has not used, in a per-cycle shuffled order.
+
+    `history` is every genre name already used, oldest first. Nothing repeats until every genre
+    has had a turn, and the next cycle draws a different order — predictable enough to reason
+    about, varied enough that two stories in a row are never the same kind of story.
+    """
+    cycle = len(history) // len(GENRES)
+    order = list(GENRES)
+    random.Random(f"genres-{cycle}").shuffle(order)
+    used = set(history[cycle * len(GENRES):])
+    return next((genre for genre in order if genre.name not in used), order[0])
+
+
+def genre_by_name(name: str) -> "Genre | None":
+    """The genre an arc opened in, so its later parts stay in that world."""
+    return next((genre for genre in GENRES if genre.name == (name or "").strip()), None)
 
 # The character signature is deliberately SHORT and placed last in the prompt: a leading
 # paragraph of description overpowers the scene and collapses every frame into a portrait.
@@ -87,9 +163,13 @@ STYLE = (
 _CHARACTER_POOL = (
     ("a girl", "a boy", "a young woman", "a man", "a child"),
     ("a black hooded raincoat", "a red trench coat", "a grey hooded poncho",
-     "a navy hooded cloak", "a green hooded jacket", "a charcoal waxed coat"),
+     "a navy school blazer", "a track jacket", "a pilot's flight suit",
+     "a shrine maiden's white haori", "a chef's apron over a black shirt",
+     "a green hooded jacket", "a charcoal waxed coat"),
     ("with a red scarf", "with a paper mask", "with glowing goggles",
-     "with a knitted beanie", "with a worn satchel", "with silver rings"),
+     "with a knitted beanie", "with a worn satchel", "with silver rings",
+     "with a bandaged hand", "with headphones around the neck",
+     "with a cracked wristwatch", "with a soy-sauce stain on the sleeve"),
 )
 
 
@@ -101,6 +181,20 @@ def make_character(series_id: str) -> str:
     """
     rng = random.Random(series_id or "arc")
     return f"{rng.choice(_CHARACTER_POOL[0])} in {rng.choice(_CHARACTER_POOL[1])} {rng.choice(_CHARACTER_POOL[2])}"
+
+
+def character_gender(signature: str) -> str:
+    """The protagonist's gender as the signature states it: 'female', 'male', or "".
+
+    "a child" and a signature with no noun say nothing, and are left to the configured voice
+    rather than guessed at — the narrator is the one thing a viewer hears for the whole story.
+    """
+    low = (signature or "").lower()
+    if re.search(r"\b(girl|woman|mother|sister|daughter|queen|princess)\b", low):
+        return "female"
+    if re.search(r"\b(boy|man|father|brother|son|king|prince)\b", low):
+        return "male"
+    return ""
 
 # Default shot rhythm for a ~45s short: 13 cuts, 2-5s each, roles in narrative order.
 # (shot_size, place, action, story_object, narrative_role, camera, character, seconds)
@@ -1094,14 +1188,28 @@ def title_from_line(line: str, *, max_words: int = 7) -> str:
     return ""
 
 
+# Strings that mark a title as pipeline output rather than a story name. All of these have
+# published on the channel as real upload titles: "Anime Short #1/4 — 2026-11-12", "Anime Short
+# #2/3 - reuse-lantern-kaito". A name is the one thing a viewer reads before deciding to swipe,
+# so a run that cannot name the story must fall back, never ship the working title.
+_TITLE_MARKERS = ("anime short", "reuse-", "reuse_", "#")
+_DATE_IN_TITLE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+
 def _validate_title(title: str) -> str:
     """Return `title` if it can be published as a story name, else "".
 
     A title is a name, not a sentence: it must have letters, stay short, and not stop on a word
-    that leaves it hanging ("The Girl Who Waited Because").
+    that leaves it hanging ("The Girl Who Waited Because"). Format labels, series ids and
+    internal strategy names are pipeline leftovers, so they are not names either.
     """
     title = re.sub(r"\s+", " ", (title or "").strip().strip("*_`\"'")).rstrip(".")
     if not title or not re.search(r"[A-Za-z]", title):
+        return ""
+    lowered = title.lower()
+    if any(marker in lowered for marker in _TITLE_MARKERS):
+        return ""
+    if _DATE_IN_TITLE.search(title) or "\ufffd" in title:
         return ""
     words = title.split()
     if len(title) > 90 or len(words) > 12:
@@ -1192,6 +1300,22 @@ def _opens_with(narration: str, hook: str, *, words: int = 6) -> bool:
         return False
     span = min(words, len(stated), len(heard))
     return span >= 4 and heard[:span] == stated[:span]
+
+
+def opening_line(shots: list[Shot]) -> str:
+    """The first words the narrator actually says, or "" when shot 1 is silent.
+
+    This is the hook card's text. It is read from the shots rather than from the plan's `Hook:`
+    line because a queued part is rendered from `state.json`, which stores shots and not the plan
+    text — so a state-reused part still opens with a card.
+    """
+    if not shots:
+        return ""
+    speech = (shots[0].speech or "").strip()
+    if not speech:
+        return ""
+    first = re.split(r"(?<=[.!?])\s+", speech)[0].strip()
+    return first if re.search(r"[A-Za-z]", first) else ""
 
 
 TITLE_INSTRUCTIONS = (
@@ -1330,8 +1454,13 @@ def plan_shorts_detailed(
     parts_range: tuple[int, int] = (1, MAX_PARTS),
     gemini_key: str = "",
     max_words: int = 0,
+    genre: "Genre | None" = None,
 ) -> tuple[list[Shot], dict[int, str], bool, int]:
     """Run the detailed prompt and parse its structured output.
+
+    `genre` names the kind of story and the light it is told in. Without it the planner has no
+    world to write in and every request comes back dark fantasy: that is what the empty theme
+    produced for twelve stories in a row.
 
     `want` is the shot count the pacing needs. It is stated in the request, checked against the
     planner's own count line, and the plan is trimmed to fit — an unpinned count came back as 7-8
@@ -1367,6 +1496,14 @@ def plan_shorts_detailed(
     system = PLAN_SYSTEM_PROMPT_DETAILED.replace("__CHARACTER_SIGNATURE__",
                                                  _signature_instruction(character))
     user = f"Theme/story idea: {theme}"
+    if genre:
+        system += (f"\n\n## Genre\nThis story is {genre.name}. Its engine: {genre.engine}\n"
+                   f"Its world and its light: {genre.look}. Every image prompt states that time "
+                   f"of day, lighting and palette, and the hook, names and places come from this "
+                   f"world rather than from an earlier story's. Do not default to night, rain, "
+                   f"a hooded figure or a missing person unless this genre's world asks for them.")
+        if not theme:
+            user = f"Genre: {genre.name} — invent a new story in it."
     if want:
         system += (f"\n\n## This request\nProduce exactly {want} shots and exactly {want} numbered "
                    f"image prompts, numbered 1-{want} with no gaps, reusing an image number when "
