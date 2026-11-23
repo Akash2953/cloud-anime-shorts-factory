@@ -11,11 +11,12 @@ from unittest.mock import patch
 import numpy as np
 
 from orchestrator import (
-    advance_series, beat_track, caption_preflight, published_video, record_published,
-    resolve_part, resolve_voice, run_pipeline, story_description, story_upload_title,
-    upload_privacy,
+    advance_series, beat_track, caption_preflight, published_video, quota_spent_today,
+    record_published, resolve_part, resolve_voice, run_pipeline, story_description,
+    story_upload_title, upload_privacy, uploads_today,
 )
 from scenes import GENRES, Shot, genre_by_name, next_genre, _template_shots, words_for_duration
+from state import today_key
 
 CFG = {
     "CFAI_TOKEN": "token", "CF_ACCOUNT_ID": "account", "OPENROUTER_API_KEY": "key",
@@ -543,6 +544,45 @@ class TestUploadMetadata(unittest.TestCase):
         state = {"series": {"title": "The Glass Storm Keeper", "parts": []}}
         self.assertEqual(story_upload_title(state, 1, 3), "The Glass Storm Keeper #1/3")
         self.assertEqual(story_upload_title(state, 1, 1), "The Glass Storm Keeper")
+
+
+class TestDailyQuota(unittest.TestCase):
+    """A second trigger on the same day must cost nothing: no plan, no images, no upload.
+
+    The workflow now has a fallback cron because GitHub's schedule dropped whole days in Nov 2026.
+    That fallback arrives after a late primary has already published, and a run that only checked
+    the upload cap *after* uploading still paid for a full render first.
+    """
+
+    def state_with(self, uploads: int) -> dict:
+        daily = {today_key(): {"image_attempts": 8, "uploads": uploads}} if uploads else {}
+        return {"processed": [], "daily": daily}
+
+    def test_no_upload_today_leaves_the_quota_unspent(self):
+        self.assertEqual(uploads_today(self.state_with(0)), 0)
+        self.assertFalse(quota_spent_today(self.state_with(0)))
+
+    def test_an_upload_today_spends_the_quota(self):
+        self.assertEqual(uploads_today(self.state_with(1)), 1)
+        self.assertTrue(quota_spent_today(self.state_with(1)))
+
+    def test_yesterdays_upload_does_not_spend_todays_quota(self):
+        self.assertFalse(quota_spent_today({"daily": {"2020-01-01": {"uploads": 4}}}))
+
+    def test_manual_and_preview_runs_are_never_guarded(self):
+        state = self.state_with(1)
+        self.assertFalse(quota_spent_today(state, part=3))
+        self.assertFalse(quota_spent_today(state, plan_only=True))
+        self.assertFalse(quota_spent_today(state, render_only=True))
+
+    def test_a_spent_quota_exits_before_planning_or_render(self):
+        state = self.state_with(1)
+        with patch("orchestrator.load_config", return_value=CFG), \
+             patch("orchestrator.load_state", return_value=state), \
+             patch("orchestrator.resolve_part") as resolve:
+            run_pipeline()
+        resolve.assert_not_called()
+        self.assertEqual(state["daily"][today_key()]["uploads"], 1)   # untouched
 
 
 if __name__ == "__main__":

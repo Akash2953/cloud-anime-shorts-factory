@@ -3,6 +3,11 @@ name: Daily Anime Short
 on:
   schedule:
     - cron: '0 12 * * *'  # Daily at 12:00 UTC
+    # Fallback for the day the scheduler drops the primary: GitHub's cron is best-effort, and
+    # through Nov 2026 this workflow's 12:00 UTC trigger arrived 6-8 h late and skipped three
+    # whole days. The run costs nothing when today's upload is already recorded in state.json
+    # (orchestrator quota_spent_today), and the concurrency group serialises the two triggers.
+    - cron: '0 20 * * *'  # 8 h later: publishes only if nothing went out today
   workflow_dispatch:
 
 permissions:

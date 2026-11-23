@@ -136,6 +136,31 @@ def record_published(state: dict, part: int, video_id: str, title: str) -> None:
     series.setdefault("published", {})[str(part)] = {"video_id": video_id, "title": title}
 
 
+def uploads_today(state: dict) -> int:
+    """How many shorts state.json says already went out today."""
+    entry = (state.get("daily") or {}).get(today_key()) or {}
+    return int(entry.get("uploads", 0) or 0)
+
+
+def quota_spent_today(state: dict, *, part: int | None = None,
+                      plan_only: bool = False, render_only: bool = False) -> bool:
+    """True when today's short is already published, so this run must not produce another.
+
+    GitHub's schedule trigger is best-effort: it arrived 6-8 h late every day in Nov 2026 and
+    dropped three days outright, which is why the workflow carries a second cron entry. That
+    fallback — and a late primary — can land after the day's upload is already done. Checking the
+    daily ledger before the first image is paid for turns those into a no-op instead of a second
+    upload the channel never wanted; without it a duplicate run still re-rendered a full short
+    before the post-upload limit check noticed.
+
+    `--part N`, `--plan-only` and `--render-only` are deliberate manual runs and stay unguarded;
+    the published ledger still refuses to publish the same part twice.
+    """
+    if plan_only or render_only or part:
+        return False
+    return uploads_today(state) >= Limits.max_daily_uploads
+
+
 def resolve_voice(cfg: dict, series: dict, character: str) -> str:
     """The narrator for this story, pinned the first time it is used.
 
@@ -379,6 +404,11 @@ def run_pipeline(*, render_only: bool = False,
                     "workers-ai"])))
     caption_preflight(cfg)
     state = load_state(Path("state.json"))
+    if quota_spent_today(state, part=part, plan_only=plan_only, render_only=render_only):
+        logger.info("Today's short is already published (%s: %d/%d upload(s)) — stopping before "
+                    "planning, images or render; a duplicated or retried trigger costs nothing",
+                    today_key(), uploads_today(state), Limits.max_daily_uploads)
+        return
     fps = 24
     shots, part_num, total_parts, state = resolve_part(cfg, state, part=part, plan_only=plan_only)
     if plan_only:
